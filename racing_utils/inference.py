@@ -54,9 +54,9 @@ class GradientDriver:
 
         self.num_contr_params = len(init_contr_params)
         self.step_directions = torch.cat(
-                [torch.zeros((1, self.num_contr_params))]
-                + [-step * torch.eye(self.num_contr_params) for step in reversed(range(1, num_steps_for_grad+1))]
-                + [ step * torch.eye(self.num_contr_params) for step in range(1, num_steps_for_grad+1)],
+                [torch.zeros((1, self.num_contr_params))],
+                # + [-step * torch.eye(self.num_contr_params) for step in reversed(range(1, num_steps_for_grad+1))]
+                # + [ step * torch.eye(self.num_contr_params) for step in range(1, num_steps_for_grad+1)],
             axis=0
         ).to(self.device)
         self.batch_size = self.step_directions.shape[0]
@@ -73,17 +73,23 @@ class GradientDriver:
             points_slices.append(points_slice)
         centerline, left_bound, right_bound = points_slices
 
-        batch_shape = (self.batch_size, 1)
         state = torch.tensor(np.r_[linear_vel_x, linear_vel_y, angular_vel_z, self.curr_delta, self.curr_speed], device=self.device, dtype=torch.float)
-        state = torch.tile(state, batch_shape)
-        contr_params = torch.tile(torch.tensor(self.curr_contr_params, device=self.device, dtype=torch.float), batch_shape)
-        centerline = torch.tile(centerline.flatten(), batch_shape)
-        left_bound = torch.tile(left_bound, batch_shape)
-        right_bound = torch.tile(right_bound, batch_shape)
+        contr_params = torch.tensor(self.curr_contr_params, device=self.device, dtype=torch.float)
 
-        state_scaled = self.features_scalers['state'].transform(state)
-        contr_params_scaled = self.features_scalers['contr_params'].transform(contr_params)
-        centerline_scaled = self.features_scalers['centerline'].transform(centerline)
+        state = state.reshape(1, -1)
+        contr_params = contr_params.reshape(1, -1)
+        centerline = centerline.flatten().reshape(1, -1)
+        # import ipdb; ipdb.set_trace()
+        # batch_shape = (self.batch_size, 1)
+        # state = torch.tile(state, batch_shape)
+        # contr_params = torch.tile(contr_params, batch_shape)
+        # centerline = torch.tile(centerline.flatten(), batch_shape)
+        # left_bound = torch.tile(left_bound, batch_shape)
+        # right_bound = torch.tile(right_bound, batch_shape)
+
+        state_scaled = self.features_scalers['state'].transform(state, copy=True)
+        contr_params_scaled = self.features_scalers['contr_params'].transform(contr_params, copy=True)
+        centerline_scaled = self.features_scalers['centerline'].transform(centerline, copy=True)
 
         new_contr_params = contr_params_scaled + self.eta * self.step_directions
 
@@ -92,11 +98,11 @@ class GradientDriver:
             trajectory_pred, actuators_pred = preds['trajectory_pred'], preds['actuators_pred']
 
         # First, let's extract the actuator values needed for driving the car
-        speeds_and_deltas = self.targets_scalers['speeds_and_deltas'].inverse_transform(actuators_pred)[0].cpu()
-        speed = speeds_and_deltas[0]
-        delta = speeds_and_deltas[len(speeds_and_deltas) // 2]
+        speeds_and_deltas = self.targets_scalers['speeds_and_deltas'].inverse_transform(actuators_pred[0], copy=True).cpu()
+        self.curr_speed = float(speeds_and_deltas[0])
+        self.curr_delta = float(speeds_and_deltas[len(speeds_and_deltas) // 2])
 
-        return float(speed), float(delta)
+        return self.curr_speed, self.curr_delta
 
         # To estimat the gradient of the reward we need the trajectory
         trajectory_pred = self.targets_scalers['trajectory'].inverse_transform(trajectory_pred)

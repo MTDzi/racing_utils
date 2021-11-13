@@ -44,6 +44,11 @@ class TensorStandardScaler(StandardScaler):
 
         return X
 
+    def to(self, device):
+        self.device = device
+        self.mean_ = self.mean_.to(device)
+        self.scale_ = self.scale_.to(device)
+
 
 def scale_batch_and_to_device(
         device: str,
