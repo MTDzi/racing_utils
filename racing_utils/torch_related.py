@@ -20,7 +20,7 @@ class TensorStandardScaler(StandardScaler):
         self.scale_ = torch.tensor(self.scale_, device=self.device, dtype=torch.float)
         self.tensorfied = True
 
-    def transform(self, X, copy=None):
+    def transform(self, X, copy=True):
         if not self.tensorfied:
             raise ValueError('You need to call `tensorfy` first')
 
@@ -32,7 +32,7 @@ class TensorStandardScaler(StandardScaler):
 
         return X
 
-    def inverse_transform(self, X, copy=None):
+    def inverse_transform(self, X, copy=True):
         if not self.tensorfied:
             raise ValueError('You need to call `tensorfy` first')
             
@@ -45,6 +45,9 @@ class TensorStandardScaler(StandardScaler):
         return X
 
     def to(self, device):
+        if not self.tensorfied:
+            raise ValueError('You need to call `tensorfy` first')
+            
         self.device = device
         self.mean_ = self.mean_.to(device)
         self.scale_ = self.scale_.to(device)
