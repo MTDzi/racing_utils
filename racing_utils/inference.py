@@ -8,6 +8,9 @@ from .torch_related import TensorStandardScaler, calc_reward_and_penalty
 from .utils import rotate_into_map_coord, closest_point_idx, cyclic_slice
 
 
+NOT_MODIFIED_IDX = 0
+
+
 class GradientDriver:
     def __init__(
             self,
@@ -94,32 +97,63 @@ class GradientDriver:
             trajectory_pred, actuators_pred = preds['trajectory_pred'], preds['actuators_pred']
 
         # First, let's extract the actuator values needed for driving the car
-        speeds_and_deltas = self.targets_scalers['speeds_and_deltas'].inverse_transform(actuators_pred[0]).cpu()
-        self.curr_speed = float(speeds_and_deltas[0])
-        self.curr_delta = float(speeds_and_deltas[len(speeds_and_deltas) // 2])
+        speeds_and_deltas = self.targets_scalers['speeds_and_deltas'].inverse_transform(actuators_pred[NOT_MODIFIED_IDX]).cpu()
+        first_speed_actuator_idx = 0
+        first_delta_actuator_idx = len(speeds_and_deltas) // 2
+        self.curr_speed = float(speeds_and_deltas[first_speed_actuator_idx])
+        self.curr_delta = float(speeds_and_deltas[first_delta_actuator_idx])
 
-        return self.curr_speed, self.curr_delta
+        # return self.curr_speed, self.curr_delta
 
-        # To estimat the gradient of the reward we need the trajectory
+
+        # TODO: make these attributes
+        self.penalty_scale_coeff = -0.9
+        self.penalty_sigma = 0.3
+        self.contr_params_limits = torch.tensor([
+            (3.0, 5.0),
+            (8.0, 14.0),
+            (8.0, 12.0),
+        ], device=self.device)
+        
+        # Now for the heavier part: calculating the gradient of the reward and penalty
+
+        # 1) To estimate the gradient of the reward we need the trajectory
         trajectory_pred = self.targets_scalers['trajectory'].inverse_transform(trajectory_pred)
         reward_pred, penalty_pred = calc_reward_and_penalty(trajectory_pred, centerline, left_bound, right_bound, penalty_sigma=self.penalty_sigma)
 
-        # Now for the heavier part: calculating the gradient of the reward and penalty
-        # TODO: add penalties
+        # 2) OK, time for gradient estimation
+        # NOTE: the following code is not the fastest implementation of the gradient calculation but notice that
+        #  the call above (to calc_reward_and_penalty) is the real bottleneck. And if not GPU is available you won't
+        #  get a significant speedup by optimizing the gradient estimating code below
+        base_reward = float(reward_pred[NOT_MODIFIED_IDX].cpu())
+        base_penalty = float(penalty_pred[NOT_MODIFIED_IDX].cpu())
         grad_contr_param = np.zeros(self.num_contr_params)
-        x = self.eta * np.arange(-self.num_steps_for_grad, self.num_steps_for_grad+1)
+        x = self.eta * np.arange(-self.num_steps_for_grad, self.num_steps_for_grad + 1)
         for contr_param_idx in range(self.num_contr_params):
-            rewards = []
+            objective = []
             for step in range(2 * self.num_steps_for_grad):
-                reward_idx = 1 + step * self.num_contr_params + contr_param_idx
-                rewards.append(float(reward_pred[reward_idx].cpu()))
+                common_idx = 1 + step * self.num_contr_params + contr_param_idx
+                reward = float(reward_pred[common_idx].cpu())
+                penalty = float(penalty_pred[common_idx].cpu())
+                objective.append(reward + self.penalty_scale_coeff * penalty)
                 if step == self.num_steps_for_grad:
-                    rewards.append(float(reward_pred[0].cpu()))
-    
-            coeffs = np.polyfit(x, rewards, deg=1)
-            grad_contr_param[contr_param_idx] = coeffs[0]
+                    objective.append(base_reward + self.penalty_scale_coeff * base_penalty)
+                    
+            coeffs = np.polyfit(x, objective, deg=1)  # Fit a line
+            grad_contr_param[contr_param_idx] = coeffs[0]  # This is the slope of the fitted line
 
-        self.curr_contr_params = self.features_scalers['contr_params'].inverse_transform(new_contr_params[0] + self.eta * torch.tensor(grad_contr_param, device=self.device))
+        self.curr_contr_params = self.features_scalers['contr_params'].inverse_transform(
+            new_contr_params[NOT_MODIFIED_IDX]
+            + self.eta * torch.tensor(grad_contr_param, device=self.device)
+        )
+        # Clip the controller parameters according to their limits
+        self.curr_contr_params = torch.clip(self.curr_contr_params, min=self.contr_params_limits[:, 0], max=self.contr_params_limits[:, 1])
+
+        print(f'lookahead = {self.curr_contr_params[0]:.2f}, '
+              f'speed_setpoint = {self.curr_contr_params[1]:.2f}, '
+              f'tire_force_max = {self.curr_contr_params[2]:.2f}')
+
+        return self.curr_speed, self.curr_delta
 
         
 
