@@ -107,13 +107,24 @@ class GradientDriver:
 
 
         # TODO: make these attributes
-        self.penalty_scale_coeff = -0.9
-        self.penalty_sigma = 0.3
+        self.penalty_scale_coeff = -1.1
+        self.penalty_sigma = 0.2
         self.contr_params_limits = torch.tensor([
             (3.0, 5.0),
             (8.0, 14.0),
             (8.0, 12.0),
         ], device=self.device)
+        # self.contr_params_limits = torch.tensor([
+        #     (3.0, 7.0),
+        #     (8.0, 16.0),
+        #     (8.0, 15.0),
+        # ], device=self.device)
+        self.contr_params_limits = torch.tensor([
+            (3.0, 6.0),
+            (8.0, 15.0),
+            (8.0, 12.0),
+        ], device=self.device)
+
         
         # Now for the heavier part: calculating the gradient of the reward and penalty
 
