@@ -1,22 +1,41 @@
-from typing import Dict, Tuple
+from typing import Dict, Sequence, Tuple
 
 import numpy as np
 
 import torch
 import torch.nn as nn
 
-from sklearn.preprocessing import StandardScaler
-
 
 class OmniwardModel(nn.Module):
+    """
+    Model predicting the future:
+     * positions and
+     * actuators given the current:
+    given the current:
+     * state of the car
+     * centerline and, most importantly,
+     * controller parameter values.
+    """
 
     FULL_TRAJ_DIM = 6
     YAW_0 = torch.tensor([0.0])
 
     def __init__(
-            self, state_size, controller_params_size, centerline_size,
-            centerline_encoder_sizes, middle_sizes, output_sizes,
-            trajectory_size, actuators_size
+            self,
+
+            # Input
+            state_size: int,
+            controller_params_size: int,
+            centerline_size: int,
+
+            # Middle part of  the architecture
+            centerline_encoder_sizes: Sequence[int],
+            middle_sizes: Sequence[int],
+            output_sizes: Sequence[int],
+
+            # Output
+            trajectory_size: int,
+            actuators_size: int,
     ):
         super().__init__()
 
@@ -33,7 +52,12 @@ class OmniwardModel(nn.Module):
         self.trajectory_predictor = self._stack_layers(sizes, nn.Linear, nn.SiLU, last_linear=True)
 
     @staticmethod
-    def _stack_layers(sizes, layer, activation, last_linear=False):
+    def _stack_layers(
+            sizes: Sequence,
+            layer: nn.Module,
+            activation: nn.Module,
+            last_linear: bool =False,
+    ):
         layers = []
         for enc_size_in, enc_size_out in zip(sizes[:-1], sizes[1:]):
             layers.append(layer(enc_size_in, enc_size_out))
@@ -42,7 +66,14 @@ class OmniwardModel(nn.Module):
             layers.pop()
         return nn.Sequential(*layers)
         
-    def forward(self, state, contr_params, centerline, left_bound, right_bound):
+    def forward(
+            self,
+            state: torch.Tensor,
+            contr_params: torch.Tensor,
+            centerline: torch.Tensor,
+            left_bound: torch.Tensor,
+            right_bound: torch.Tensor,
+    ):
         centerline_enc = self.centerline_encoder(centerline)
 
         centerline_for_middle = centerline_enc.clone()
@@ -58,67 +89,41 @@ class OmniwardModel(nn.Module):
         }
 
 
-class TrajectoryAndActuatorsForExport:
+def get_omniward_model(
+        num_layers: int,
+        width_reduction: float,
+        features: Dict[str, np.array],
+        targets: Dict[str, np.array],
+        device: str,
+) -> OmniwardModel:
+    """
+    Determines the architecture of the model based on the feature and target sizes, creates the OmniwardModel,
+    pushes it to the specified device, and returns it.
+    """
+    state_size = len(features['state'])
+    contr_params_size = len(features['contr_params'])
+    centerline_size = len(features['centerline'])
+    trajectory_size = len(targets['trajectory'])
+    actuators_size = len(targets['speeds_and_deltas'])
 
-    def __init__(self, model: nn.Module, features_scalers: Dict[str, StandardScaler], targets_scalers: Dict[str, StandardScaler]):
-        self.model = model
-        self.features_scalers = features_scalers
-        self.targets_scalers = targets_scalers
+    centerline_encoder_sizes = num_layers * [int(centerline_size // width_reduction // width_reduction)]
+    middle_sizes = num_layers * [int((centerline_size + trajectory_size + actuators_size) // width_reduction // width_reduction)]
+    output_sizes = [
+        int(centerline_size // width_reduction),
+        int((trajectory_size + actuators_size) // width_reduction // width_reduction),
+        int((trajectory_size + actuators_size) // width_reduction),
+    ]
 
-    def predict(self, bounds: Tuple[np.ndarray, np.ndarray], features: Dict[str, torch.Tensor]) -> Tuple[float, float]:
-        with torch.inference_mode:
-            preds = self.model(**features)
-            actuators_pred = preds['actuators_pred']
+    omniward_model = OmniwardModel(
+        state_size,
+        contr_params_size,
+        centerline_size,
+        centerline_encoder_sizes,
+        middle_sizes,
+        output_sizes,
+        trajectory_size,
+        actuators_size,
+    )
+    omniward_model.to(device)
 
-        half = len(actuators_pred)
-        delta, speed = actuators_pred[0], actuators_pred[half]
-
-
-# class OneActuatorModel(nn.Module):
-
-#     def __init__(self, num_layers: int = 3, num_neurons: int = 30):
-#         super().__init__()
-        
-#         layers = []
-#         for enc_size_in, enc_size_out in zip(bound_encoder_sizes[:-1], bound_encoder_sizes[1:]):
-#             layers.append(nn.Linear(enc_size_in, enc_size_out))
-#             bound_enc_layers.append(nn.SiLU(inplace=True))
-        
-#         self.bound_encoder = nn.Sequential(*bound_enc_layers)
-            
-#         middle_layers = []
-#         middle_sizes = [state_size + 2 * enc_size_out] + middle_sizes
-#         for in_size, out_size in zip(middle_sizes[:-1], middle_sizes[1:]):
-#             middle_layers.append(nn.Linear(in_size, out_size))
-#             middle_layers.append(nn.SiLU(inplace=True))
-            
-#         self.middle_part = nn.Sequential(*middle_layers)
-            
-#         trajectory_layers = []
-#         actuators_layers = []
-#         output_sizes = [out_size] + output_sizes
-#         for in_size, out_size in zip(output_sizes[:-1], output_sizes[1:]):
-#             trajectory_layers.append(nn.Linear(in_size, out_size))
-#             trajectory_layers.append(nn.SiLU(inplace=True))
-#             actuators_layers.append(nn.Linear(in_size, out_size))
-#             actuators_layers.append(nn.SiLU(inplace=True))
-            
-#         trajectory_layers.append(nn.Linear(out_size, trajectory_size))
-#         actuators_layers.append(nn.Linear(out_size, actuators_size))
-            
-#         self.trajectory_predictor_head = nn.Sequential(*trajectory_layers)
-#         self.actuators_predictor_head = nn.Sequential(*actuators_layers)
-
-#     def forward(self, state, left_bound, right_bound):
-#         left_bound_enc = self.bound_encoder(left_bound)
-#         right_bound_enc = self.bound_encoder(right_bound)
-            
-#         combined = torch.cat([state, left_bound_enc, right_bound_enc], axis=1)
-#         combined = self.middle_part(combined)
-            
-#         for_trajectory = combined.clone()
-#         for_actuators = combined.clone()
-#         trajectory_pred = self.trajectory_predictor_head(for_trajectory)
-#         actuators_pred = self.actuators_predictor_head(for_actuators)
-          
-#         return {'trajectory_pred': trajectory_pred, 'actuators_pred': actuators_pred}
+    return omniward_model

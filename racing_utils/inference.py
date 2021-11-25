@@ -1,10 +1,10 @@
-from typing import Dict
+from typing import Dict, Sequence
 
 import numpy as np
 
 import torch
 
-from .torch_related import TensorStandardScaler, calc_reward_and_penalty
+from .torch_related import TensorStandardScaler, calc_progress_and_penalty
 from .utils import rotate_into_map_coord, closest_point_idx, cyclic_slice
 
 
@@ -12,6 +12,42 @@ NOT_MODIFIED_IDX = 0
 
 
 class GradientDriver:
+    """Controls the car using a trained model + modifying part of its input so as to maximize reward.
+
+    Runs inference for the model and modifies the controller parameters (that are part of the input of the model)
+    according to an approximated gradient of the (progress - penalty) objective function.
+
+    Attributes:
+        points: A list containing the arrays: centerline, left_bound, and right_bound.
+        num_steps: How many elements from arrays in the points list are used.
+
+        omniward_model: Model that predicts the future trajectory (2D positions of the car) and
+            future actuator actions needed to realize that trajectory.
+        features_scalers: A mapping from feature names to features scalers that are required to make predictions
+            with the model.
+        targets_scalers: A mapping from target names to target scalers that are required to unpack predictions
+            made with the model (so as to get proper actuator values).
+
+        eta: Step size used in the space of controller parameters (after scaling) used for approximating the gradient
+            of the objective function; the bigger the step, the less reliable it is; the smaller the step, the more
+            noisy the approximation. After approximating the gradient, controller parameter values are modified via a crude
+            gradient descent algorithm in which the step size is also eta (although almost certainly a different value would be
+            more suitable, yet for simplicity sake the step size in both cases is the same, and it's this attribute eta).
+        num_steps_for_grad: Number of steps in the positive direction of each of the controller parameters when approximating
+            the gradient. Consequently, the size of the batch is (2 * num_steps_for_grad + 1) ** num_contr_params.
+        num_contr_params: Number of controller parameters emulated by the model, i.e. used as input by the model and
+            modifying its behavior based on their values.
+        step_directions: A matrix whose rows correnspond to vectors by which the controller parameter values ought to be
+            modified when forming a batch for estimating.
+
+        penalty_scale_coeff: The objective function is actually not (progress - penalty) but rather:
+            progress + penalty_scale_coeff * penalty.
+        penalty_sigma: The sigma used in the Gaussian-distribution-like components when calculating the penalty (see 
+            the calc_progress_and_penalty function).
+        contr_params_limits: When doing gradient descent on the controller parameters, the new values will be clipped
+            by the values specified in this tensor.
+    """
+
     def __init__(
             self,
 
@@ -34,7 +70,13 @@ class GradientDriver:
             # Gradient-related
             eta: float = 0.1,
             num_steps_for_grad: int = 4,
-            penalty_sigma: float = 0.4,
+            penalty_sigma: float = 0.3,
+            penalty_scale_coeff: float = -0.9,
+            contr_params_limits: torch.Tensor = torch.tensor([
+                (3.0, 5.0),
+                (8.0, 14.0),
+                (8.0, 12.0),
+            ]),
 
             device: str = 'cpu',
     ):
@@ -47,25 +89,41 @@ class GradientDriver:
 
         self.eta = eta
         self.num_steps_for_grad = num_steps_for_grad
-        self.penalty_sigma = penalty_sigma
 
         self.curr_delta = 0.0
         self.curr_speed = 0.0
-        self.curr_contr_params = init_contr_params
+        self.curr_contr_params = torch.tensor(init_contr_params, device=device, dtype=torch.float)
 
         self.device = device
 
         self.num_contr_params = len(init_contr_params)
         self.step_directions = torch.cat(
                 [torch.zeros((1, self.num_contr_params))]
-                + [-step * torch.eye(self.num_contr_params) for step in reversed(range(1, num_steps_for_grad+1))]
-                + [ step * torch.eye(self.num_contr_params) for step in range(1, num_steps_for_grad+1)],
+                + [-step * torch.eye(self.num_contr_params) for step in reversed(range(1, num_steps_for_grad + 1))]
+                + [ step * torch.eye(self.num_contr_params) for step in range(1, num_steps_for_grad + 1)],
             axis=0
         ).to(self.device)
         self.batch_size = self.step_directions.shape[0]
 
+        assert penalty_scale_coeff < 0, (
+            'The penalty_scale_coeff passed was positive which makes no sense given that the objective function is:\n'
+            '\t progress + penalty_scale_coeff * penalty\n'
+        )
+        self.penalty_scale_coeff = penalty_scale_coeff
+        self.penalty_sigma = penalty_sigma
+        self.contr_params_limits = contr_params_limits.to(self.device)
 
-    def plan(self, ranges, yaw, pos_x, pos_y, linear_vel_x, linear_vel_y, angular_vel_z):
+
+    def plan(
+            self,
+            ranges: Sequence[float],
+            yaw: float,
+            pos_x: float,
+            pos_y: float,
+            linear_vel_x: float,
+            linear_vel_y: float,
+            angular_vel_z: float,
+    ):
         position = np.array([pos_x, pos_y])
         points_slices = []
         for points, num_steps in zip(self.points, self.nums_steps):
@@ -77,7 +135,7 @@ class GradientDriver:
         centerline, left_bound, right_bound = points_slices
 
         state = torch.tensor(np.r_[linear_vel_x, linear_vel_y, angular_vel_z, self.curr_delta, self.curr_speed], device=self.device, dtype=torch.float)
-        contr_params = torch.tensor(self.curr_contr_params, device=self.device, dtype=torch.float)
+        contr_params = self.curr_contr_params.clone().detach().float()
 
         batch_shape = (self.batch_size, 1)
         state = torch.tile(state, batch_shape)
@@ -102,55 +160,34 @@ class GradientDriver:
         first_delta_actuator_idx = len(speeds_and_deltas) // 2
         self.curr_speed = float(speeds_and_deltas[first_speed_actuator_idx])
         self.curr_delta = float(speeds_and_deltas[first_delta_actuator_idx])
-
-        # return self.curr_speed, self.curr_delta
-
-
-        # TODO: make these attributes
-        self.penalty_scale_coeff = -1.1
-        self.penalty_sigma = 0.2
-        self.contr_params_limits = torch.tensor([
-            (3.0, 5.0),
-            (8.0, 14.0),
-            (8.0, 12.0),
-        ], device=self.device)
-        # self.contr_params_limits = torch.tensor([
-        #     (3.0, 7.0),
-        #     (8.0, 16.0),
-        #     (8.0, 15.0),
-        # ], device=self.device)
-        self.contr_params_limits = torch.tensor([
-            (3.0, 6.0),
-            (8.0, 15.0),
-            (8.0, 12.0),
-        ], device=self.device)
-
         
-        # Now for the heavier part: calculating the gradient of the reward and penalty
+        #                                                                                  # 
+        #  Now for the heavier part: calculating the gradient of the progress and penalty  #
+        #                                                                                  #
 
-        # 1) To estimate the gradient of the reward we need the trajectory
+        # 1) To estimate the gradient of the progress we need the trajectory
         trajectory_pred = self.targets_scalers['trajectory'].inverse_transform(trajectory_pred)
-        reward_pred, penalty_pred = calc_reward_and_penalty(trajectory_pred, centerline, left_bound, right_bound, penalty_sigma=self.penalty_sigma)
+        progress_pred, penalty_pred = calc_progress_and_penalty(trajectory_pred, centerline, left_bound, right_bound, penalty_sigma=self.penalty_sigma)
 
         # 2) OK, time for gradient estimation
-        # NOTE: the following code is not the fastest implementation of the gradient calculation but notice that
-        #  the call above (to calc_reward_and_penalty) is the real bottleneck. And if not GPU is available you won't
-        #  get a significant speedup by optimizing the gradient estimating code below
-        base_reward = float(reward_pred[NOT_MODIFIED_IDX].cpu())
+        # NOTE: the following code is not the fastest implementation of the gradient estimation but notice that
+        #  the call above (to calc_progress_and_penalty) is the real bottleneck. And if no GPU is available you won't
+        #  get a significant speedup by optimizing the gradient estimating below
+        base_progress = float(progress_pred[NOT_MODIFIED_IDX].cpu())
         base_penalty = float(penalty_pred[NOT_MODIFIED_IDX].cpu())
         grad_contr_param = np.zeros(self.num_contr_params)
         x = self.eta * np.arange(-self.num_steps_for_grad, self.num_steps_for_grad + 1)
         for contr_param_idx in range(self.num_contr_params):
-            objective = []
+            reward = []
             for step in range(2 * self.num_steps_for_grad):
                 common_idx = 1 + step * self.num_contr_params + contr_param_idx
-                reward = float(reward_pred[common_idx].cpu())
+                progress = float(progress_pred[common_idx].cpu())
                 penalty = float(penalty_pred[common_idx].cpu())
-                objective.append(reward + self.penalty_scale_coeff * penalty)
+                reward.append(progress + self.penalty_scale_coeff * penalty)
                 if step == self.num_steps_for_grad:
-                    objective.append(base_reward + self.penalty_scale_coeff * base_penalty)
+                    reward.append(base_progress + self.penalty_scale_coeff * base_penalty)
                     
-            coeffs = np.polyfit(x, objective, deg=1)  # Fit a line
+            coeffs = np.polyfit(x, reward, deg=1)  # Fit a line
             grad_contr_param[contr_param_idx] = coeffs[0]  # This is the slope of the fitted line
 
         self.curr_contr_params = self.features_scalers['contr_params'].inverse_transform(

@@ -1,3 +1,7 @@
+"""
+Classes and functions that use PyTorch but are neither models nor inference utensils.
+"""
+
 from typing import Dict, Tuple, NewType
 
 import torch
@@ -9,6 +13,13 @@ Batch = NewType('Batch', Dict[str, torch.Tensor])
 
 
 class TensorStandardScaler(StandardScaler):
+    """
+    Like the sklearn version, this class transforms features by subtracting the mean, and
+     dividing by the standard deviation.
+
+    The crucial difference is that this scaler can operate on tensors, so the computation can
+     be carried out on  the GPU.
+    """
 
     def __init__(self, device, **kwargs):
         super().__init__(**kwargs)
@@ -60,6 +71,10 @@ def scale_batch_and_to_device(
         features_batch: Batch,
         targets_batch: Batch,
 ) -> Tuple[Batch, Batch]:
+    """
+    Calls the .transform method of the scalers on the features and targets, and then moves
+     them to the device specified.
+    """
     features_batch = {
         feature_name: features_scalers[feature_name].transform(features_batch[feature_name].float().to(device))
         for feature_name in features_batch.keys()
@@ -71,7 +86,10 @@ def scale_batch_and_to_device(
     return features_batch, targets_batch
 
 
-def calc_reward_and_penalty(trajectory, centerline, left_bound, right_bound, penalty_sigma=0.4):
+def calc_progress_and_penalty(trajectory, centerline, left_bound, right_bound, penalty_sigma=0.4):
+    """
+    Calculates the progress along the centerline + penalty caused by closeness to any of the bounds.
+    """
     batch_size = len(trajectory)
     trajectory = trajectory.reshape(batch_size, -1, 2)
     centerline = centerline.reshape(batch_size, -1, 2)

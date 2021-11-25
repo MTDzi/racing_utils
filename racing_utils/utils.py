@@ -1,15 +1,27 @@
-import numpy as np    
+"""
+Contains functions that did not fit any other module.
+"""
+from functools import lru_cache
+
+import numpy as np
 
 
-def rotate_into_map_coord(vec, angle):
-    # TODO: this can be done faster
-    cos = np.cos(angle)
-    sin = np.sin(angle)
-    rot_mat = np.array([[cos, sin], [-sin, cos]])
+@lru_cache(maxsize=1000)
+def get_rotation_matrix(angle_rad: float) -> np.array:
+    """Construct and memoize a 2D rotation matrix for a given angle (in radians)."""
+    cos = np.cos(angle_rad)
+    sin = np.sin(angle_rad)
+    return np.array([[cos, sin], [-sin, cos]])
+
+
+def rotate_into_map_coord(vec: np.array, angle_rad: float) -> np.array:
+    """Rotate a vector (or vectors) by a given angle (in radians)."""
+    rot_mat = get_rotation_matrix(angle_rad)
     return vec.dot(rot_mat)
 
 
-def closest_point_idx(point_or_points, other_points):
+def closest_point_idx(point_or_points: np.array, other_points: np.array) -> int:
+    """Find the indices of the points in other_points that are closest to the points in point_or_points."""
     return_one = (len(point_or_points.shape) == 1)
     dists = np.linalg.norm(other_points[:, np.newaxis] - point_or_points[np.newaxis], axis=2)
     argmins = np.argmin(dists, axis=0)
@@ -19,7 +31,7 @@ def closest_point_idx(point_or_points, other_points):
         return argmins
 
 
-def cyclic_slice(points, start_idx, num_points_ahead):
+def cyclic_slice(points: np.array, start_idx: int, num_points_ahead: int) -> np.array:
     end_idx = start_idx + num_points_ahead
     num_points_missing = end_idx - len(points)
     if num_points_missing <= 0:
@@ -28,7 +40,7 @@ def cyclic_slice(points, start_idx, num_points_ahead):
         return np.r_[points[start_idx:], points[:num_points_missing]]
 
 
-def determine_direction_of_bound(bound, start_position, end_position):
+def determine_direction_of_bound(bound: np.array, start_position: np.array, end_position: np.array):
     closest_bound_idx_start = closest_point_idx(start_position, bound)
     closest_bound_idx_end = closest_point_idx(end_position, bound)
 
