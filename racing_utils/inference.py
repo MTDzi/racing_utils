@@ -69,16 +69,17 @@ class GradientDriver:
 
             # Gradient-related
             eta: float = 0.1,
-            num_steps_for_grad: int = 4,
-            penalty_sigma: float = 0.3,
+            num_steps_for_grad: int = 3,
+            penalty_sigma: float = 0.2,
             penalty_scale_coeff: float = -0.9,
             contr_params_limits: torch.Tensor = torch.tensor([
                 (3.0, 5.0),
-                (8.0, 14.0),
+                (8.0, 13.0),
                 (8.0, 12.0),
             ]),
 
             device: str = 'cpu',
+            debug: bool = False,
     ):
         self.points = [centerline, left_bound, right_bound]
         self.nums_steps = [num_steps_centerline, num_steps_ahead_bound, num_steps_ahead_bound]
@@ -112,6 +113,8 @@ class GradientDriver:
         self.penalty_scale_coeff = penalty_scale_coeff
         self.penalty_sigma = penalty_sigma
         self.contr_params_limits = contr_params_limits.to(self.device)
+
+        self.debug = debug
 
 
     def plan(
@@ -197,9 +200,10 @@ class GradientDriver:
         # Clip the controller parameters according to their limits
         self.curr_contr_params = torch.clip(self.curr_contr_params, min=self.contr_params_limits[:, 0], max=self.contr_params_limits[:, 1])
 
-        print(f'lookahead = {self.curr_contr_params[0]:.2f}, '
-              f'speed_setpoint = {self.curr_contr_params[1]:.2f}, '
-              f'tire_force_max = {self.curr_contr_params[2]:.2f}')
+        if self.debug:
+            print(f'lookahead = {self.curr_contr_params[0]:.2f}, '
+                f'speed_setpoint = {self.curr_contr_params[1]:.2f}, '
+                f'tire_force_max = {self.curr_contr_params[2]:.2f}')
 
         return self.curr_speed, self.curr_delta
 
