@@ -1,4 +1,4 @@
-from typing import Dict, Sequence
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 
@@ -126,6 +126,7 @@ class GradientDriver:
             linear_vel_x: float,
             linear_vel_y: float,
             angular_vel_z: float,
+            lap_time: Optional[float] = None,
     ):
         position = np.array([pos_x, pos_y])
         points_slices = []
