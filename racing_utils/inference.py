@@ -77,6 +77,7 @@ class GradientDriver:
                 (8.0, 13.0),
                 (8.0, 12.0),
             ]),
+            only_closest_for_penalty: bool = False,
 
             device: str = 'cpu',
             debug: bool = False,
@@ -113,6 +114,7 @@ class GradientDriver:
         self.penalty_scale_coeff = penalty_scale_coeff
         self.penalty_sigma = penalty_sigma
         self.contr_params_limits = contr_params_limits.to(self.device)
+        self.only_closest_for_penalty = only_closest_for_penalty
 
         self.debug = debug
 
@@ -171,7 +173,14 @@ class GradientDriver:
 
         # 1) To estimate the gradient of the progress we need the trajectory
         trajectory_pred = self.targets_scalers['trajectory'].inverse_transform(trajectory_pred)
-        progress_pred, penalty_pred = calc_progress_and_penalty(trajectory_pred, centerline, left_bound, right_bound, penalty_sigma=self.penalty_sigma)
+        progress_pred, penalty_pred = calc_progress_and_penalty(
+            trajectory_pred,
+            centerline,
+            left_bound,
+            right_bound,
+            penalty_sigma=self.penalty_sigma,
+            only_closest=self.only_closest_for_penalty,
+        )
 
         # 2) OK, time for gradient estimation
         # NOTE: the following code is not the fastest implementation of the gradient estimation but notice that
@@ -203,10 +212,20 @@ class GradientDriver:
 
         if self.debug:
             print(f'lookahead = {self.curr_contr_params[0]:.2f}, '
-                f'speed_setpoint = {self.curr_contr_params[1]:.2f}, '
-                f'tire_force_max = {self.curr_contr_params[2]:.2f}')
+                  f'speed_setpoint = {self.curr_contr_params[1]:.2f}, '
+                  f'tire_force_max = {self.curr_contr_params[2]:.2f}')
 
         return self.curr_speed, self.curr_delta
 
-        
+    def to(self, device):
+        self.device = device
+        self.step_directions = self.step_directions.to(self.device)
+        self.curr_contr_params = self.curr_contr_params.to(self.device)
+        self.omniward_model = self.omniward_model.to(self.device)
+        self.contr_params_limits = self.contr_params_limits.to(self.device)
 
+        for features_scaler in self.features_scalers.values():
+            features_scaler.to(self.device)
+
+        for targets_scaler in self.targets_scalers.values():
+            targets_scaler.to(self.device)

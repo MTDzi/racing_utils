@@ -86,7 +86,14 @@ def scale_batch_and_to_device(
     return features_batch, targets_batch
 
 
-def calc_progress_and_penalty(trajectory, centerline, left_bound, right_bound, penalty_sigma=0.4):
+def calc_progress_and_penalty(
+        trajectory: torch.Tensor,
+        centerline: torch.Tensor,
+        left_bound: torch.Tensor,
+        right_bound: torch.Tensor,
+        penalty_sigma: float = 0.4,
+        only_closest: bool = False,
+):
     """
     Calculates the progress along the centerline + penalty caused by closeness to any of the bounds.
     """
@@ -117,7 +124,12 @@ def calc_progress_and_penalty(trajectory, centerline, left_bound, right_bound, p
     
     penalty = 0
     for bound in [left_bound, right_bound]:
-        penalty += torch.exp(-torch.linalg.norm(bound[:, None] - trajectory[:, :, None], axis=3) / penalty_sigma / penalty_sigma).sum(axis=(1, 2))
+        distances = torch.linalg.norm(bound[:, None] - trajectory[:, :, None], axis=3)
+        gaussed_distances = torch.exp(-distances / penalty_sigma / penalty_sigma)
+        if only_closest:
+            penalty += gaussed_distances.view(-1, gaussed_distances.shape[1] * gaussed_distances.shape[2]).min(axis=1)[0]
+        else:
+            penalty += gaussed_distances.sum(axis=(1, 2))
 
     which_beyond = (penalty > reward)
     penalty[which_beyond] = reward[which_beyond]
