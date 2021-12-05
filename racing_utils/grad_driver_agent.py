@@ -6,12 +6,13 @@ import torch
 
 from .torch_related import TensorStandardScaler, calc_progress_and_penalty
 from .utils import rotate_into_map_coord, closest_point_idx, cyclic_slice
+from .base_agent import BaseAgent
 
 
 NOT_MODIFIED_IDX = 0
 
 
-class GradientDriver:
+class GradientDriverAgent(BaseAgent):
     """Controls the car using a trained model + modifying part of its input so as to maximize reward.
 
     Runs inference for the model and modifies the controller parameters (that are part of the input of the model)

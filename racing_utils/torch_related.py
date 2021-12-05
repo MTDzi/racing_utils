@@ -1,6 +1,7 @@
 """
 Classes and functions that use PyTorch but are neither models nor inference utensils.
 """
+from __future__ import annotations
 
 from typing import Dict, Tuple, NewType
 
@@ -12,6 +13,10 @@ from sklearn.preprocessing import StandardScaler
 Batch = NewType('Batch', Dict[str, torch.Tensor])
 
 
+class NotTensorfiedYetException(Exception):
+    pass
+
+
 class TensorStandardScaler(StandardScaler):
     """
     Like the sklearn version, this class transforms features by subtracting the mean, and
@@ -21,7 +26,7 @@ class TensorStandardScaler(StandardScaler):
      be carried out on  the GPU.
     """
 
-    def __init__(self, device, **kwargs):
+    def __init__(self, device: str, **kwargs):
         super().__init__(**kwargs)
         self.device = device
         self.tensorfied = False
@@ -31,9 +36,9 @@ class TensorStandardScaler(StandardScaler):
         self.scale_ = torch.tensor(self.scale_, device=self.device, dtype=torch.float)
         self.tensorfied = True
 
-    def transform(self, X, copy=True):
+    def transform(self, X: torch.Tensor, copy: bool = True) -> torch.Tensor:
         if not self.tensorfied:
-            raise ValueError('You need to call `tensorfy` first')
+            raise NotTensorfiedYetException('You need to call `tensorfy` first')
 
         if copy is False:
             X -= self.mean_
@@ -43,9 +48,9 @@ class TensorStandardScaler(StandardScaler):
 
         return X
 
-    def inverse_transform(self, X, copy=True):
+    def inverse_transform(self, X: torch.Tensor, copy: bool = True) -> torch.Tensor:
         if not self.tensorfied:
-            raise ValueError('You need to call `tensorfy` first')
+            raise NotTensorfiedYetException('You need to call `tensorfy` first')
             
         if copy is False:
             X *= self.scale_
@@ -55,13 +60,15 @@ class TensorStandardScaler(StandardScaler):
 
         return X
 
-    def to(self, device):
+    def to(self, device: str) -> TensorStandardScaler:
         if not self.tensorfied:
-            raise ValueError('You need to call `tensorfy` first')
+            raise NotTensorfiedYetException('You need to call `tensorfy` first')
             
         self.device = device
         self.mean_ = self.mean_.to(device)
         self.scale_ = self.scale_.to(device)
+
+        return self
 
 
 def scale_batch_and_to_device(
@@ -93,7 +100,7 @@ def calc_progress_and_penalty(
         right_bound: torch.Tensor,
         penalty_sigma: float = 0.4,
         only_closest: bool = False,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Calculates the progress along the centerline + penalty caused by closeness to any of the bounds.
     """
