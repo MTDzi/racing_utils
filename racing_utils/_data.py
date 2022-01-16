@@ -10,37 +10,37 @@ class _RaceData:
     def __init__(self, dump_directory: str = '/tmp'):
         self.dump_directory = Path(dump_directory)
         self.states = {
-            'time': [],
+            'yaw': [],
             'position': [],
             'v_x': [],
             'v_y': [],
-            'speed_actuator': [],
-            'yaw': [],
-            'delta': [],
             'omega': [],
+            'delta': [],
+            'speed_actuator': [],
+            'time': [],
         }
         self.step = 0
 
     def add(
             self,
-            time: float,
+            yaw: float,
             position: np.array,
             v_x: float,
             v_y: float,
-            speed_actuator: float,
-            yaw: float,
-            delta: float,
             omega: float,
+            delta: float,
+            speed_actuator: float,
+            time: float,
             **kwargs,
     ):
-        self.states['time'].append(time)
+        self.states['yaw'].append(yaw)
         self.states['position'].append(position)
         self.states['v_x'].append(v_x)
         self.states['v_y'].append(v_y)
-        self.states['speed_actuator'].append(speed_actuator)
-        self.states['yaw'].append(yaw)
-        self.states['delta'].append(delta)
         self.states['omega'].append(omega)
+        self.states['delta'].append(delta)
+        self.states['speed_actuator'].append(speed_actuator)
+        self.states['time'].append(time)
         for key, value in kwargs.items():
             if key not in self.states:
                 self.states[key] = []

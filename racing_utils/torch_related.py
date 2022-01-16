@@ -93,6 +93,7 @@ def scale_batch_and_to_device(
     return features_batch, targets_batch
 
 
+@torch.inference_mode()
 def calc_progress_and_penalty(
         trajectory: torch.Tensor,
         centerline: torch.Tensor,
@@ -100,7 +101,7 @@ def calc_progress_and_penalty(
         right_bound: torch.Tensor,
         penalty_sigma: float = 0.4,
         only_closest: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+):
     """
     Calculates the progress along the centerline + penalty caused by closeness to any of the bounds.
     """
@@ -132,6 +133,57 @@ def calc_progress_and_penalty(
     penalty = 0
     for bound in [left_bound, right_bound]:
         distances = torch.linalg.norm(bound[:, None] - trajectory[:, :, None], axis=3)
+        gaussed_distances = torch.exp(-distances / penalty_sigma / penalty_sigma)
+        if only_closest:
+            penalty += gaussed_distances.view(-1, gaussed_distances.shape[1] * gaussed_distances.shape[2]).min(axis=1)[0]
+        else:
+            penalty += gaussed_distances.sum(axis=(1, 2))
+
+    which_beyond = (penalty > reward)
+    penalty[which_beyond] = reward[which_beyond]
+
+    return reward, penalty
+
+
+# TODO: this and the function above can be combined into one
+@torch.inference_mode()
+def calc_progress_and_penalty_while_driving(
+        trajectory: torch.Tensor,
+        centerline: torch.Tensor,
+        left_bound: torch.Tensor,
+        right_bound: torch.Tensor,
+        penalty_sigma: float = 0.4,
+        only_closest: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Calculates the progress along the centerline + penalty caused by closeness to any of the bounds.
+    """
+    batch_size = len(trajectory)
+    trajectory = trajectory.reshape(batch_size, -1, 2)
+    
+    last_position = trajectory[:, -1]
+    dists = torch.linalg.norm(centerline[None] - last_position[:, None], axis=2)
+    closest_centerline_idx = torch.argmin(dists, axis=1)
+    dists_along_centerline = torch.linalg.norm(torch.diff(centerline, axis=0), axis=1).cumsum(axis=0)
+    dists_along_centerline = torch.tile(dists_along_centerline, (batch_size, 1))
+    arange = torch.arange(batch_size)
+    closest_centerline_idx_for_diff = closest_centerline_idx - 1
+    closest_centerline_idx_for_diff[closest_centerline_idx_for_diff == -1] = 0
+    reward = dists_along_centerline[arange, closest_centerline_idx_for_diff]
+
+    versor_to_last_position = last_position - centerline[closest_centerline_idx]
+    versor_to_last_position /= torch.linalg.norm(versor_to_last_position) + 1e-10
+
+    closest_centerline_idx_for_last_centerline_vector = closest_centerline_idx + 1
+    centerline_len = centerline.shape[1]
+    closest_centerline_idx_for_last_centerline_vector[closest_centerline_idx_for_last_centerline_vector == centerline_len] = centerline_len - 1
+    last_centerline_vector = centerline[closest_centerline_idx_for_last_centerline_vector] - centerline[closest_centerline_idx_for_last_centerline_vector - 1]
+    
+    reward -= (versor_to_last_position * last_centerline_vector).sum(axis=1)
+    
+    penalty = 0
+    for bound in [left_bound, right_bound]:
+        distances = torch.linalg.norm(bound[None, None] - trajectory[:, :, None], axis=3)
         gaussed_distances = torch.exp(-distances / penalty_sigma / penalty_sigma)
         if only_closest:
             penalty += gaussed_distances.view(-1, gaussed_distances.shape[1] * gaussed_distances.shape[2]).min(axis=1)[0]

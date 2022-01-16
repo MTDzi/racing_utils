@@ -22,34 +22,14 @@ class OmniwardModel(nn.Module):
 
     def __init__(
             self,
-
-            # Input
-            state_size: int,
-            controller_params_size: int,
-            centerline_size: int,
-
-            # Middle part of  the architecture
-            centerline_encoder_sizes: Sequence[int],
             middle_sizes: Sequence[int],
-            output_sizes: Sequence[int],
-
-            # Output
-            trajectory_size: int,
-            actuators_size: int,
+            actuators_head_sizes: Sequence[int],
+            trajectory_head_sizes: Sequence[int],
     ):
         super().__init__()
-
-        sizes = [centerline_size] + centerline_encoder_sizes
-        self.centerline_encoder = self._stack_layers(sizes, nn.Linear, nn.SiLU)
-
-        sizes = [state_size + centerline_encoder_sizes[-1] + controller_params_size] + middle_sizes
-        self.middle_encoder = self._stack_layers(sizes, nn.Linear, nn.SiLU)
-
-        sizes = [middle_sizes[-1]] + output_sizes + [actuators_size]
-        self.actuators_predictor = self._stack_layers(sizes, nn.Linear, nn.SiLU, last_linear=True)
-
-        sizes = [middle_sizes[-1]] + output_sizes + [trajectory_size]
-        self.trajectory_predictor = self._stack_layers(sizes, nn.Linear, nn.SiLU, last_linear=True)
+        self.middle_encoder = self._stack_layers(middle_sizes, nn.Linear, nn.SiLU)
+        self.actuators_predictor = self._stack_layers(actuators_head_sizes, nn.Linear, nn.SiLU, last_linear=True)
+        self.trajectory_predictor = self._stack_layers(trajectory_head_sizes, nn.Linear, nn.SiLU, last_linear=True)
 
     @staticmethod
     def _stack_layers(
@@ -60,7 +40,7 @@ class OmniwardModel(nn.Module):
     ):
         layers = []
         for enc_size_in, enc_size_out in zip(sizes[:-1], sizes[1:]):
-            layers.append(layer(enc_size_in, enc_size_out))
+            layers.append(layer(enc_size_in, int(enc_size_out)))
             layers.append(activation(inplace=True))
         if last_linear:
             layers.pop()
@@ -70,18 +50,14 @@ class OmniwardModel(nn.Module):
             self,
             state: torch.Tensor,
             contr_params: torch.Tensor,
+            waypoints: torch.Tensor,
             centerline: torch.Tensor,
             left_bound: torch.Tensor,
             right_bound: torch.Tensor,
     ):
-        centerline_enc = self.centerline_encoder(centerline)
-
-        centerline_for_middle = centerline_enc.clone()
-        middle = self.middle_encoder(torch.cat([state, contr_params, centerline_for_middle], axis=1))
-        middle_for_trajectory = middle.clone()
-        middle_for_actuators = middle.clone()
-        trajectory_pred = self.trajectory_predictor(middle_for_trajectory)
-        actuators_pred = self.actuators_predictor(middle_for_actuators)
+        middle = self.middle_encoder(torch.cat([state, contr_params, waypoints], axis=1))
+        trajectory_pred = self.trajectory_predictor(middle.clone())
+        actuators_pred = self.actuators_predictor(middle.clone())
 
         return {
             'trajectory_pred': trajectory_pred,
@@ -90,7 +66,8 @@ class OmniwardModel(nn.Module):
 
 
 def get_omniward_model(
-        num_layers: int,
+        num_layers_waypoint_encoder: int,
+        num_layers_middle: int,
         width_reduction: float,
         features: Dict[str, np.array],
         targets: Dict[str, np.array],
@@ -102,23 +79,27 @@ def get_omniward_model(
     """
     state_size = len(features['state'])
     contr_params_size = len(features['contr_params'])
-    centerline_size = len(features['centerline'])
+    waypoints_size = len(features['waypoints_bezier'])
     trajectory_size = len(targets['trajectory'])
     actuators_size = len(targets['speeds_and_deltas'])
 
-    centerline_encoder_sizes = num_layers * [int(centerline_size // width_reduction // width_reduction)]
-    middle_sizes = num_layers * [int((centerline_size + trajectory_size + actuators_size) // width_reduction // width_reduction)]
+    waypoints_encoder_sizes = [waypoints_size]
+    for _ in range(num_layers_waypoint_encoder):
+        waypoints_encoder_sizes.append(int(waypoints_encoder_sizes[-1] // width_reduction))
+
+    middle_sizes = [waypoints_encoder_sizes[-1]]
+    for _ in range(num_layers_middle):
+        middle_sizes.append(int(middle_sizes[-1] // width_reduction))
+
     output_sizes = [
-        int(centerline_size // width_reduction),
-        int((trajectory_size + actuators_size) // width_reduction // width_reduction),
+        middle_sizes[-1],
         int((trajectory_size + actuators_size) // width_reduction),
     ]
 
     omniward_model = OmniwardModel(
         state_size,
         contr_params_size,
-        centerline_size,
-        centerline_encoder_sizes,
+        waypoints_encoder_sizes,
         middle_sizes,
         output_sizes,
         trajectory_size,

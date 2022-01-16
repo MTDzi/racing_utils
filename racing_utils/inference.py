@@ -4,7 +4,7 @@ import numpy as np
 
 import torch
 
-from .torch_related import TensorStandardScaler, calc_progress_and_penalty
+from .torch_related import TensorStandardScaler, calc_progress_and_penalty_while_driving
 from .utils import rotate_into_map_coord, closest_point_idx, cyclic_slice
 
 
@@ -43,7 +43,7 @@ class GradientDriver:
         penalty_scale_coeff: The objective function is actually not (progress - penalty) but rather:
             progress + penalty_scale_coeff * penalty.
         penalty_sigma: The sigma used in the Gaussian-distribution-like components when calculating the penalty (see 
-            the calc_progress_and_penalty function).
+            the calc_progress_and_penalty_while_driving function).
         contr_params_limits: When doing gradient descent on the controller parameters, the new values will be clipped
             by the values specified in this tensor.
     """
@@ -175,7 +175,7 @@ class GradientDriver:
 
         # 1) To estimate the gradient of the progress we need the trajectory
         trajectory_pred = self.targets_scalers['trajectory'].inverse_transform(trajectory_pred)
-        progress_pred, penalty_pred = calc_progress_and_penalty(
+        progress_pred, penalty_pred = calc_progress_and_penalty_while_driving(
             trajectory_pred,
             centerline,
             left_bound,
@@ -186,7 +186,7 @@ class GradientDriver:
 
         # 2) OK, time for gradient estimation
         # NOTE: the following code is not the fastest implementation of the gradient estimation but notice that
-        #  the call above (to calc_progress_and_penalty) is the real bottleneck. And if no GPU is available you won't
+        #  the call above (to calc_progress_and_penalty_while_driving) is the real bottleneck. And if no GPU is available you won't
         #  get a significant speedup by optimizing the gradient estimating below
         base_progress = float(progress_pred[NOT_MODIFIED_IDX].cpu())
         base_penalty = float(penalty_pred[NOT_MODIFIED_IDX].cpu())

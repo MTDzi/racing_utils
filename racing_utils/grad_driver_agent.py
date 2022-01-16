@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple, Dict, Any
 
 import numpy as np
 
@@ -7,6 +7,7 @@ import torch
 from .torch_related import TensorStandardScaler, calc_progress_and_penalty
 from .utils import rotate_into_map_coord, closest_point_idx, cyclic_slice
 from .base_agent import BaseAgent
+from ._data import _RaceData
 
 
 NOT_MODIFIED_IDX = 0
@@ -121,7 +122,6 @@ class GradientDriverAgent(BaseAgent):
 
         self.debug = debug
 
-
     def plan(
             self,
             ranges: Sequence[float],
@@ -132,36 +132,18 @@ class GradientDriverAgent(BaseAgent):
             linear_vel_y: float,
             angular_vel_z: float,
             lap_time: Optional[float] = None,
-    ):
+    ) -> Tuple[float, float]:
+
         position = np.array([pos_x, pos_y])
-        points_slices = []
-        for points, num_steps in zip(self.points, self.nums_steps):
-            closest_idx = closest_point_idx(position, points)
-            points_slice = cyclic_slice(points, closest_idx, num_steps)
-            points_slice = rotate_into_map_coord(points_slice - position, -yaw)
-            points_slice = torch.tensor(points_slice, device=self.device, dtype=torch.float)
-            points_slices.append(points_slice)
-        centerline, left_bound, right_bound = points_slices
+        centerline, left_bound, right_bound = self.extract_centerline_and_bounds(yaw, position)
 
-        state = torch.tensor(np.r_[linear_vel_x, linear_vel_y, angular_vel_z, self.curr_delta, self.curr_speed], device=self.device, dtype=torch.float)
-        contr_params = self.curr_contr_params.clone().detach().float()
-
-        batch_shape = (self.batch_size, 1)
-        state = torch.tile(state, batch_shape)
-        contr_params = torch.tile(contr_params, batch_shape)
-        centerline = torch.tile(centerline.flatten(), batch_shape)
-        left_bound = torch.tile(left_bound, batch_shape)
-        right_bound = torch.tile(right_bound, batch_shape)
-
-        state_scaled = self.features_scalers['state'].transform(state)
-        contr_params_scaled = self.features_scalers['contr_params'].transform(contr_params)
-        centerline_scaled = self.features_scalers['centerline'].transform(centerline)
-
-        new_contr_params = contr_params_scaled + self.eta_for_grad * self.step_directions
-
-        with torch.inference_mode():
-            preds = self.omniward_model(state_scaled, new_contr_params, centerline_scaled, None, None)
-            trajectory_pred, actuators_pred = preds['trajectory_pred'], preds['actuators_pred']
+        # This is where the prediction takes place
+        trajectory_pred, actuators_pred, curr_contr_params_scaled = self.calc_predictions(
+            centerline,
+            linear_vel_x,
+            linear_vel_y,
+            angular_vel_z,
+        )
 
         # First, let's extract the actuator values needed for driving the car
         speeds_and_deltas = self.targets_scalers['speeds_and_deltas'].inverse_transform(actuators_pred[NOT_MODIFIED_IDX]).cpu()
@@ -207,7 +189,7 @@ class GradientDriverAgent(BaseAgent):
             grad_contr_param[contr_param_idx] = coeffs[0]  # This is the slope of the fitted line
 
         self.curr_contr_params = self.features_scalers['contr_params'].inverse_transform(
-            new_contr_params[NOT_MODIFIED_IDX]
+            curr_contr_params_scaled
             + self.eta_for_update * torch.tensor(grad_contr_param, device=self.device)
         )
         # Clip the controller parameters according to their limits
@@ -218,7 +200,68 @@ class GradientDriverAgent(BaseAgent):
                   f'speed_setpoint = {self.curr_contr_params[1]:.2f}, '
                   f'tire_force_max = {self.curr_contr_params[2]:.2f}')
 
+        if self.ego_data is not None:
+            self._gather_data(
+                yaw, position, linear_vel_x, linear_vel_y, angular_vel_z,
+                self.curr_delta, self.curr_speed, lap_time,
+            )
+
         return self.curr_speed, self.curr_delta
+
+    def extract_centerline_and_bounds(
+            self,
+            yaw: float,
+            position: np.array,
+    ) -> Tuple[np.array, np.array, np.array]:
+        """Extract centerline and bound slices used for prediction and reward calculations."""
+        points_slices = []
+        for points, num_steps in zip(self.points, self.nums_steps):
+            closest_idx = closest_point_idx(position, points)
+            points_slice = cyclic_slice(points, closest_idx, num_steps)
+            points_slice = rotate_into_map_coord(points_slice - position, -yaw)
+            points_slice = torch.tensor(points_slice, device=self.device, dtype=torch.float)
+            points_slices.append(points_slice)
+        centerline, left_bound, right_bound = points_slices
+        return centerline, left_bound, right_bound
+
+    def calc_predictions(
+            self,
+            centerline: np.array,
+            linear_vel_x: float,
+            linear_vel_y: float,
+            angular_vel_z: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Calculates the predicted trajectory and actuators, as well as current controller params (scaled and tiled)."""
+        state = torch.tensor(np.r_[linear_vel_x, linear_vel_y, angular_vel_z, self.curr_delta, self.curr_speed], device=self.device, dtype=torch.float)
+        contr_params = self.curr_contr_params.clone().detach().float()
+
+        batch_shape = (self.batch_size, 1)
+        state = torch.tile(state, batch_shape)
+        contr_params = torch.tile(contr_params, batch_shape)
+        centerline_tiled = torch.tile(centerline.flatten(), batch_shape)
+
+        state_scaled = self.features_scalers['state'].transform(state)
+        curr_contr_params_scaled = self.features_scalers['contr_params'].transform(contr_params)
+        centerline_scaled = self.features_scalers['centerline'].transform(centerline_tiled)
+
+        probe_contr_params = curr_contr_params_scaled + self.eta_for_grad * self.step_directions
+
+        waypoints_scaled = centerline_scaled  # TODO: use Bezier
+        with torch.inference_mode():
+            preds = self.omniward_model(state_scaled, probe_contr_params, waypoints_scaled, centerline_scaled, None, None)
+            trajectory_pred, actuators_pred = preds['trajectory_pred'], preds['actuators_pred']
+
+        return trajectory_pred, actuators_pred, curr_contr_params_scaled[0]
+
+    def _compose_additional_data(self) -> Dict[str, Any]:
+        return {
+            'lookahead_distance': float(self.curr_contr_params[0]),
+            'speed_setpoint': float(self.curr_contr_params[1]),
+            'tire_force_max': float(self.curr_contr_params[2]),
+            'centerline': self.points[0],
+            'left_bound': self.points[1],
+            'right_bound': self.points[2],
+        }
 
     def to(self, device):
         self.device = device

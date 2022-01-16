@@ -1,12 +1,14 @@
 import time
 import sys
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
 
 from .utils import rotate_into_map_coord, closest_point_idx
 from .base_agent import BaseAgent
+from ._data import _RaceData
 
 
 class PurePursuitAgent(BaseAgent):
@@ -85,7 +87,7 @@ class PurePursuitAgent(BaseAgent):
         self.setup_cache()
 
         if self.collect_data:
-            self.ego_data = Data()
+            self.ego_data = _RaceData()
 
         if self.scan_walls:
             self.wall_scan_thus_far = None
@@ -122,12 +124,17 @@ class PurePursuitAgent(BaseAgent):
 
         delta, speed = self.cap_delta_and_speed(delta, speed)
 
-        self._gather_data(delta, speed, target_point, lap_time)
+        if self.ego_data is not None:
+            self._gather_data(
+                self.yaw, self.position, linear_vel_x, linear_vel_y, angular_vel_z, delta, speed, lap_time,
+                target_point=target_point,
+            )
 
         if self.noise is True:
             speed += self.SPEED_NOISE_LEVEL * np.random.normal()
             delta += self.DELTA_NOISE_LEVEL * np.random.normal()
             delta, speed = self.cap_delta_and_speed(delta, speed)
+
         return speed, delta
 
     @staticmethod
@@ -379,6 +386,14 @@ class PurePursuitAgent(BaseAgent):
         self.prev_speed = new_speed
         return new_delta, new_speed
 
+    def _compose_additional_data(self) -> Dict[str, Any]:
+        return {
+            'lookahead_distance': self.lookahead_distance,
+            'speed_setpoint': self.speed,
+            'tire_force_max': self.tire_force_max,
+            'max_allowable_twist_linear_x': self.max_allowable_twist_linear_x,
+            'centerline': self.waypoints,
+        }
 
     @staticmethod
     def intersects(segA, segB):
@@ -397,11 +412,3 @@ class PurePursuitAgent(BaseAgent):
     @staticmethod
     def get_angle(delta):
         return np.arctan2(delta[1], delta[0])
-
-    @staticmethod
-    def _angle_back_to_domain(angle):
-        if angle > np.pi:
-            angle -= 2*np.pi
-        elif angle < -np.pi:
-            angle += 2*np.pi
-        return angle

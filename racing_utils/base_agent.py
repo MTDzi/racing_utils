@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Any
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +9,10 @@ from ._data import _RaceData
 
 class BaseAgent(ABC):
     collect_data: bool
-    ego_data: _RaceData
+    ego_data: _RaceData = None
+
+    def setup_data_collection(self):
+        self.ego_data = _RaceData()
 
     @abstractmethod
     def plan(
@@ -26,38 +29,36 @@ class BaseAgent(ABC):
 
     def _gather_data(
             self,
+            yaw: float,
+            position: np.array,
+            v_x: float,
+            v_y: float,
+            omega: float,
             delta: float,
             speed: float,
-            target_point: np.array,
-            lap_time: Optional[float] = None,
+            lap_time: float,
+            **additional_info
     ):
-        if not self.collect_data:
-            return
-
-        if lap_time is None:
-            raise ValueError('When gathering data, lap_time argument needs to be provided')
-
         self.ego_data.add(
-            time=lap_time,
-            position=self.position,
-            v_x=self.linear_vel_x,
-            v_y=self.linear_vel_y,
-            speed_actuator=speed,
-            yaw=self._angle_back_to_domain(self.yaw),
+            yaw=self._angle_back_to_domain(yaw),
+            position=position,
+            v_x=v_x,
+            v_y=v_y,
+            omega=omega,
             delta=delta,
-            omega=self.angular_vel_z,
-            target_point=target_point,
+            speed_actuator=speed,
+            time=lap_time,
+            **additional_info,
         )
 
     def dump_data(self, filename: Optional[Path] = None):
-        additional_data = {
-            'lookahead_distance': self.lookahead_distance,
-            'speed_setpoint': self.speed,
-            'tire_force_max': self.tire_force_max,
-            'max_allowable_twist_linear_x': self.max_allowable_twist_linear_x,
-            'centerline': self.waypoints,
-        }
+        additional_data = self._compose_additional_data()
         self.ego_data.dump(filename, additional_data)
+        self.ego_data = _RaceData()
+
+    @abstractmethod
+    def _compose_additional_data(self) -> Dict[str, Any]:
+        pass
 
     @staticmethod
     def _angle_back_to_domain(angle: float) -> float:
