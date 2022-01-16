@@ -1,9 +1,11 @@
 """
 Contains functions that did not fit any other module.
 """
+from typing import Tuple
 from functools import lru_cache
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 
 @lru_cache(maxsize=1000)
@@ -83,3 +85,74 @@ def penalty_from_bounds(positions: np.array, left_bound: np.array, right_bound: 
         penalty += exps.sum()
 
     return penalty
+
+
+def straighten_up_arc(arc: np.array) -> Tuple[np.array, np.array, float]:
+    translation = -arc[0]
+    arc += translation
+    direction = arc[-1]
+    yaw = np.arctan2(direction[0], direction[1]) - np.pi / 2
+    arc = rotate_into_map_coord(arc, yaw)
+    return arc, -translation, -yaw
+
+
+def mutate_centerline(
+    real_centerline: np.array,
+    num_modifications: int,
+    amplitude_lims: Tuple[float] = (0.5, 1.0),
+    length_lims = (100, 250),
+    mutation_sigma_lims = (1, 3),
+    power_lims = (0.5, 1.1),
+    debug: bool = False,
+) -> np.array:
+    """Adds modifications to the centerline without modifying it and returning the mutated copy."""
+
+    centerline = real_centerline.copy()
+
+    for _ in range(num_modifications):
+
+        length = np.random.randint(*length_lims)
+        if length % 2 == 0: length += 1
+        start_idx = np.random.randint(0, len(centerline) - length)
+
+        amplitude = np.random.uniform(*amplitude_lims)
+        mutation_sigma = length // np.random.uniform(*mutation_sigma_lims)
+        power = np.random.uniform(*power_lims)
+        sign = np.random.choice([-1, 1])
+
+        if debug:
+            print(f'length = {length:.2f}\namplitude = {amplitude:.2f}\nmutation_sigma = {mutation_sigma:.2f}\npower = {power:.2f}\n')
+            plt.plot(centerline[:, 0], centerline[:, 1])
+            plt.plot(centerline[start_idx:(start_idx + length), 0], centerline[start_idx:(start_idx + length), 1], c='r')
+            plt.show()
+
+        arc = centerline[start_idx:(start_idx + length)].copy()
+        arc, translation, yaw = straighten_up_arc(arc)
+        x0 = length // 2
+
+        modification = np.exp(-power * (np.arange(length) - x0)**2 / mutation_sigma / mutation_sigma)
+        modification -= modification[0]
+        modification /= np.abs(modification).max()
+        modification *= sign * amplitude
+        modified_arc = np.c_[arc[:, 0], arc[:, 1] + modification]
+        if debug:
+            plt.plot(modified_arc[:, 0], modified_arc[:, 1])
+            plt.plot(arc[:, 0], arc[:, 1], c='k')
+            plt.show()
+
+        modified_arc = rotate_into_map_coord(modified_arc, yaw) + translation
+        if debug:
+            plt.plot(centerline[:, 0], centerline[:, 1])
+
+        centerline[start_idx:(start_idx + length)] = modified_arc
+
+        if debug:
+            plt.plot(centerline[start_idx:(start_idx + length), 0], centerline[start_idx:(start_idx + length), 1], c='r')
+            x_min, y_min = modified_arc.min(axis=0)
+            x_max, y_max = modified_arc.max(axis=0)
+            plt.xlim(x_min - 5, x_max + 5)
+            plt.ylim(y_min - 5, y_max + 5)
+            plt.gca().set_aspect('equal')
+            plt.show()
+
+    return centerline
