@@ -55,10 +55,10 @@ def bernstein_poly(i, n, t):
     """
     The Bernstein polynomial of n, i as a function of t
     """
-    return comb(n, i) * ( t**(n-i) ) * (1 - t)**i
+    return comb(n, i) * (t ** (n-i)) * (1 - t) ** i
 
 
-def bezier_curve(points, nTimes=50):
+def bezier_curve(points: np.array, num_points: int = 50) -> np.array:
     """
     Given a set of control points, return the
     bezier curve defined by the control points.
@@ -67,7 +67,7 @@ def bezier_curve(points, nTimes=50):
     such as [ [1,1], 
                 [2,3], 
                 [4,5], ..[Xn, Yn] ]
-    nTimes is the number of time steps, defaults to 1000
+    num_points is the number of time steps, defaults to 1000
 
     See http://processingjs.nihongoresources.com/bezierinfo/
     """
@@ -76,14 +76,14 @@ def bezier_curve(points, nTimes=50):
     xPoints = np.array([p[0] for p in points])
     yPoints = np.array([p[1] for p in points])
 
-    t = np.linspace(0.0, 1.0, nTimes)
+    t = np.linspace(0.0, 1.0, num_points)
 
-    polynomial_array = np.array([ bernstein_poly(i, nPoints-1, t) for i in range(0, nPoints)   ])
+    polynomial_array = np.array([bernstein_poly(i, nPoints-1, t) for i in range(0, nPoints)])
 
     xvals = np.dot(xPoints, polynomial_array)
     yvals = np.dot(yPoints, polynomial_array)
 
-    return xvals, yvals
+    return np.c_[xvals, yvals]
 
 
 def fit_plot_and_evaluate(waypoints: np.array, degree: int, make_plots: bool = False) -> Tuple[float, float, float]:
@@ -91,24 +91,25 @@ def fit_plot_and_evaluate(waypoints: np.array, degree: int, make_plots: bool = F
 
     # Get the Bezier parameters based on a degree.
     data = get_bezier_parameters(xpoints, ypoints, degree=degree)
-    x_val = [x[0] for x in data]
-    y_val = [x[1] for x in data]
-
-    xvals, yvals = bezier_curve(data, nTimes=len(xpoints))
+    
+    bezier = bezier_curve(data, num_points=len(xpoints))
 
     if make_plots:
         # Plot the original points
         plt.plot(xpoints, ypoints, "ro",label='Original Points', alpha=0.1)
         
         # Plot the control points
+        x_val = [x[0] for x in data]
+        y_val = [x[1] for x in data]
         plt.plot(x_val, y_val,'k--o', label='Control Points')
 
         # Plot the resulting Bezier curve
-        plt.plot(xvals, yvals, 'b-', label='B Curve', linewidth=4)
+        plt.plot(bezier[:, 0], bezier[:, 1], 'b-', label='B Curve', linewidth=4)
 
         plt.legend()
         plt.ticklabel_format(useOffset=False)
         plt.show()
 
-    diff = np.linalg.norm(np.c_[xvals[::-1], yvals[::-1]] - waypoints, axis=1)
+    diff = np.linalg.norm(bezier[::-1] - waypoints, axis=1)
     return diff.mean(), diff.std(), diff.max()
+    

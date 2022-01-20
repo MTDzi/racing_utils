@@ -12,5 +12,6 @@ setup(
         'numpy >= 1.21.2',
         'torch >= 1.9.1',
         'scikit-learn >= 1.0',
+        'matplotlib >= 3.4.3'
     ],
 )

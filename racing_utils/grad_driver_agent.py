@@ -4,13 +4,15 @@ import numpy as np
 
 import torch
 
-from .torch_related import TensorStandardScaler, calc_progress_and_penalty
+from .torch_related import TensorStandardScaler, calc_progress_and_penalty_while_driving
 from .utils import rotate_into_map_coord, closest_point_idx, cyclic_slice
 from .base_agent import BaseAgent
+from .bezier import get_bezier_parameters, bezier_curve
 from ._data import _RaceData
 
 
 NOT_MODIFIED_IDX = 0
+POINT_DIM = 2
 
 
 class GradientDriverAgent(BaseAgent):
@@ -69,6 +71,9 @@ class GradientDriverAgent(BaseAgent):
             features_scalers: Dict[str, TensorStandardScaler],
             targets_scalers: Dict[str, TensorStandardScaler],
 
+            # Bezier-related
+            bezier_degree: int,
+
             # Gradient-related
             eta_for_grad: float = 0.1,
             eta_for_update: Optional[float] = None,
@@ -103,13 +108,18 @@ class GradientDriverAgent(BaseAgent):
         self.device = device
 
         self.num_contr_params = len(init_contr_params)
-        self.step_directions = torch.cat(
-                [torch.zeros((1, self.num_contr_params))]
-                + [-step * torch.eye(self.num_contr_params) for step in reversed(range(1, num_steps_for_grad + 1))]
-                + [ step * torch.eye(self.num_contr_params) for step in range(1, num_steps_for_grad + 1)],
-            axis=0
-        ).to(self.device)
-        self.batch_size = self.step_directions.shape[0]
+        self.contr_params_step_directions = torch.cat(
+            [-step * torch.eye(self.num_contr_params) for step in reversed(range(1, num_steps_for_grad + 1))]
+            + [ step * torch.eye(self.num_contr_params) for step in range(1, num_steps_for_grad + 1)],
+        axis=0).to(self.device)
+
+        self.num_bezier_points = self.bezier_degree + 1
+        self.bezier_points_step_directions = np.concatenate([
+            [-step * np.eye(POINT_DIM * self.num_points_bezier) for step in reversed(range(1, self.num_steps_for_grad + 1))]
+            + [ step * np.eye(POINT_DIM * self.num_points_bezier) for step in range(1, self.num_steps_for_grad + 1)]
+        ], axis=0)
+
+        self.batch_size = 1 + self.contr_params_step_directions.shape[0] + self.bezier_points_step_directions.shape[0]
 
         assert penalty_scale_coeff < 0, (
             'The penalty_scale_coeff passed was positive which makes no sense given that the objective function is:\n'
@@ -120,6 +130,7 @@ class GradientDriverAgent(BaseAgent):
         self.contr_params_limits = contr_params_limits.to(self.device)
         self.only_closest_for_penalty = only_closest_for_penalty
 
+        self.bezier_degree = bezier_degree
         self.debug = debug
 
     def plan(
@@ -158,7 +169,7 @@ class GradientDriverAgent(BaseAgent):
 
         # 1) To estimate the gradient of the progress we need the trajectory
         trajectory_pred = self.targets_scalers['trajectory'].inverse_transform(trajectory_pred)
-        progress_pred, penalty_pred = calc_progress_and_penalty(
+        progress_pred, penalty_pred = calc_progress_and_penalty_while_driving(
             trajectory_pred,
             centerline,
             left_bound,
@@ -167,9 +178,9 @@ class GradientDriverAgent(BaseAgent):
             only_closest=self.only_closest_for_penalty,
         )
 
-        # 2) OK, time for gradient estimation
+        # 2) OK, time for gradient estimation for contr_params
         # NOTE: the following code is not the fastest implementation of the gradient estimation but notice that
-        #  the call above (to calc_progress_and_penalty) is the real bottleneck. And if no GPU is available you won't
+        #  the call above (to calc_progress_and_penalty_while_driving) is the real bottleneck. And if no GPU is available you won't
         #  get a significant speedup by optimizing the gradient estimating below
         base_progress = float(progress_pred[NOT_MODIFIED_IDX].cpu())
         base_penalty = float(penalty_pred[NOT_MODIFIED_IDX].cpu())
@@ -199,6 +210,26 @@ class GradientDriverAgent(BaseAgent):
             print(f'lookahead = {self.curr_contr_params[0]:.2f}, '
                   f'speed_setpoint = {self.curr_contr_params[1]:.2f}, '
                   f'tire_force_max = {self.curr_contr_params[2]:.2f}')
+
+        # 3) Finally, we need to compute the gradient of self.curr_bezier_points_delta
+        num_bezier_coords = POINT_DIM * self.num_bezier_points
+        grad_bezier_points_delta = np.zeros(num_bezier_coords)
+        x = self.eta_for_grad * np.arange(-self.num_steps_for_grad, self.num_steps_for_grad + 1)
+        offset = 1 + len(self.contr_params_step_directions)
+        for bezier_idx in range(num_bezier_coords):
+            reward = []
+            for step in range(2 * self.num_steps_for_grad):
+                common_idx = offset + step * num_bezier_coords + bezier_idx
+                progress = float(progress_pred[common_idx].cpu())
+                penalty = float(penalty_pred[common_idx].cpu())
+                reward.append(progress + self.penalty_scale_coeff * penalty)
+                if step == self.num_steps_for_grad:
+                    reward.append(base_progress + self.penalty_scale_coeff * base_penalty)
+                    
+            coeffs = np.polyfit(x, reward, deg=1)  # Fit a line
+            grad_bezier_points_delta[bezier_idx] = coeffs[0]  # This is the slope of the fitted line
+
+        self.curr_bezier_points_delta += (self.eta_for_update * grad_bezier_points_delta).reshape(-1, 2)
 
         if self.ego_data is not None:
             self._gather_data(
@@ -232,23 +263,62 @@ class GradientDriverAgent(BaseAgent):
             angular_vel_z: float,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Calculates the predicted trajectory and actuators, as well as current controller params (scaled and tiled)."""
+
+
+        self.bezier_degree = 8
+        self.contr_params_step_directions = torch.cat(
+            [-step * torch.eye(self.num_contr_params) for step in reversed(range(1, self.num_steps_for_grad + 1))]
+            + [ step * torch.eye(self.num_contr_params) for step in range(1, self.num_steps_for_grad + 1)],
+        axis=0).to(self.device)
+        self.contr_params_step_shape = self.contr_params_step_directions.shape[0]
+
+        self.num_bezier_points = self.bezier_degree + 1
+        self.curr_bezier_points_delta = np.zeros((self.num_bezier_points, 2))
+        self.bezier_points_step_directions = np.concatenate([
+            [-step * np.eye(POINT_DIM * self.num_bezier_points) for step in reversed(range(1, self.num_steps_for_grad + 1))]
+            + [ step * np.eye(POINT_DIM * self.num_bezier_points) for step in range(1, self.num_steps_for_grad + 1)]
+        ], axis=0)
+        self.bezier_points_step_directions = self.bezier_points_step_directions.reshape(
+
+            2 * self.num_steps_for_grad,  # "2 * " because there are two directions / dimension, i.e. (-step, +step)
+            POINT_DIM * self.num_bezier_points,  # each point has POINT_DIM coordinates
+
+            # Now, for each direction and each bezier point coordinate there's a matrix of the 
+            #  following shape (mostly zeros, only one position has a non-zero value) that
+            #  will be added to the bezier points
+            self.num_bezier_points,
+            POINT_DIM,
+        )
+        self.bezier_points_step_shape = self.bezier_points_step_directions.shape[0] * self.bezier_points_step_directions.shape[1]
+
+        self.batch_size = 1 + self.contr_params_step_shape + self.bezier_points_step_shape
+
+
+
+
         state = torch.tensor(np.r_[linear_vel_x, linear_vel_y, angular_vel_z, self.curr_delta, self.curr_speed], device=self.device, dtype=torch.float)
         contr_params = self.curr_contr_params.clone().detach().float()
 
         batch_shape = (self.batch_size, 1)
         state = torch.tile(state, batch_shape)
-        contr_params = torch.tile(contr_params, batch_shape)
-        centerline_tiled = torch.tile(centerline.flatten(), batch_shape)
+
+        curr_waypoints, waypoints_modified = self._bezierize_and_modify_waypoints(centerline)
+        curr_waypoints_tiled = torch.tile(curr_waypoints, (1 + self.contr_params_step_shape, 1))
+        waypoints = torch.concat([curr_waypoints_tiled, waypoints_modified])
 
         state_scaled = self.features_scalers['state'].transform(state)
         curr_contr_params_scaled = self.features_scalers['contr_params'].transform(contr_params)
-        centerline_scaled = self.features_scalers['centerline'].transform(centerline_tiled)
+        waypoints_scaled = self.features_scalers['waypoints'].transform(waypoints)
 
-        probe_contr_params = curr_contr_params_scaled + self.eta_for_grad * self.step_directions
+        contr_params_modified = curr_contr_params_scaled + self.eta_for_grad * self.contr_params_step_directions
+        contr_params_altogether = torch.concat([
+            curr_contr_params_scaled[None],
+            contr_params_modified,
+            torch.tile(curr_contr_params_scaled, (self.bezier_points_step_shape, 1)),
+        ])
 
-        waypoints_scaled = centerline_scaled  # TODO: use Bezier
         with torch.inference_mode():
-            preds = self.omniward_model(state_scaled, probe_contr_params, waypoints_scaled, centerline_scaled, None, None)
+            preds = self.omniward_model(state_scaled, contr_params_altogether, waypoints_scaled, None, None, None)
             trajectory_pred, actuators_pred = preds['trajectory_pred'], preds['actuators_pred']
 
         return trajectory_pred, actuators_pred, curr_contr_params_scaled[0]
@@ -265,7 +335,7 @@ class GradientDriverAgent(BaseAgent):
 
     def to(self, device):
         self.device = device
-        self.step_directions = self.step_directions.to(self.device)
+        self.contr_params_step_directions = self.contr_params_step_directions.to(self.device)
         self.curr_contr_params = self.curr_contr_params.to(self.device)
         self.omniward_model = self.omniward_model.to(self.device)
         self.contr_params_limits = self.contr_params_limits.to(self.device)
@@ -275,3 +345,22 @@ class GradientDriverAgent(BaseAgent):
 
         for targets_scaler in self.targets_scalers.values():
             targets_scaler.to(self.device)
+
+    def _bezierize_and_modify_waypoints(self, centerline: np.array) -> Tuple[np.array, np.array]:
+        # We want the unmodified curr_waypoints to be of shape:
+        #   (POINT_DIM * len(centerline), )
+        #  to then tile them
+        curr_waypoints = (centerline.numpy() + bezier_curve(self.curr_bezier_points_delta, num_points=len(centerline))).flatten()
+        
+        bezier_points_modified = self.curr_bezier_points_delta.copy() + self.eta_for_grad * self.bezier_points_step_directions
+        bezier_points_modified = bezier_points_modified.reshape(-1, self.num_bezier_points, POINT_DIM)
+        waypoints_modified = np.r_[[
+            centerline.numpy() + bezier_curve(bezier_points, num_points=len(centerline))
+            for bezier_points in bezier_points_modified
+        ]]
+        # We want the modified waypoints be of the shape:
+        #   (self.bezier_points_step_shape, POINT_DIM * len(centerline))
+        #  to then concat it togher with the contr_params part of the batch
+        waypoints_modified = waypoints_modified.reshape(waypoints_modified.shape[0], -1)
+        
+        return torch.tensor(curr_waypoints, dtype=torch.float32), torch.tensor(waypoints_modified, dtype=torch.float32)
