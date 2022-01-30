@@ -83,7 +83,7 @@ def bezier_curve(points: np.array, num_points: int = 50) -> np.array:
     xvals = np.dot(xPoints, polynomial_array)
     yvals = np.dot(yPoints, polynomial_array)
 
-    return np.c_[xvals, yvals]
+    return np.c_[xvals, yvals][::-1]
 
 
 def fit_plot_and_evaluate(waypoints: np.array, degree: int, make_plots: bool = False) -> Tuple[float, float, float]:
@@ -110,6 +110,6 @@ def fit_plot_and_evaluate(waypoints: np.array, degree: int, make_plots: bool = F
         plt.ticklabel_format(useOffset=False)
         plt.show()
 
-    diff = np.linalg.norm(bezier[::-1] - waypoints, axis=1)
+    diff = np.linalg.norm(bezier - waypoints, axis=1)
     return diff.mean(), diff.std(), diff.max()
     

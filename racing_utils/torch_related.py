@@ -3,9 +3,13 @@ Classes and functions that use PyTorch but are neither models nor inference uten
 """
 from __future__ import annotations
 
-from typing import Dict, Tuple, NewType
+from typing import Dict, Tuple, NewType, Optional, Union
+from functools import lru_cache
+from math import sqrt
 
 import torch
+import numpy as np
+from scipy.special import comb
 
 from sklearn.preprocessing import StandardScaler
 
@@ -133,7 +137,7 @@ def calc_progress_and_penalty(
     penalty = 0
     for bound in [left_bound, right_bound]:
         distances = torch.linalg.norm(bound[:, None] - trajectory[:, :, None], axis=3)
-        gaussed_distances = torch.exp(-distances / penalty_sigma / penalty_sigma)
+        gaussed_distances = torch.exp(-distances / penalty_sigma / penalty_sigma) / sqrt(2 * torch.pi) / penalty_sigma
         if only_closest:
             penalty += gaussed_distances.view(-1, gaussed_distances.shape[1] * gaussed_distances.shape[2]).min(axis=1)[0]
         else:
@@ -152,8 +156,8 @@ def calc_progress_and_penalty_while_driving(
         centerline: torch.Tensor,
         left_bound: torch.Tensor,
         right_bound: torch.Tensor,
+        ranges: Optional[torch.Tensor] = None,
         penalty_sigma: float = 0.4,
-        only_closest: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Calculates the progress along the centerline + penalty caused by closeness to any of the bounds.
@@ -182,15 +186,51 @@ def calc_progress_and_penalty_while_driving(
     reward -= (versor_to_last_position * last_centerline_vector).sum(axis=1)
     
     penalty = 0
+    dupa = 0.25  # TODO
     for bound in [left_bound, right_bound]:
         distances = torch.linalg.norm(bound[None, None] - trajectory[:, :, None], axis=3)
-        gaussed_distances = torch.exp(-distances / penalty_sigma / penalty_sigma)
-        if only_closest:
-            penalty += gaussed_distances.view(-1, gaussed_distances.shape[1] * gaussed_distances.shape[2]).min(axis=1)[0]
-        else:
-            penalty += gaussed_distances.sum(axis=(1, 2))
+        gaussed_distances = torch.exp(-distances / penalty_sigma / penalty_sigma) / sqrt(2 * torch.pi) / penalty_sigma
+        gaussed_distances = gaussed_distances * (distances < dupa).float()    
+        penalty += gaussed_distances.sum(axis=(1, 2))
 
-    which_beyond = (penalty > reward)
-    penalty[which_beyond] = reward[which_beyond]
+    if ranges is not None:
+        distances = torch.linalg.norm(ranges[None, None] - trajectory[:, :, None], axis=3)
+        gaussed_distances = torch.exp(-distances / penalty_sigma / penalty_sigma) / sqrt(2 * torch.pi) / penalty_sigma
+        gaussed_distances = gaussed_distances * (distances < dupa).float()    
+        penalty += gaussed_distances.sum(axis=(1, 2))
+
+    # which_beyond = (penalty > reward)
+    # penalty[which_beyond] = reward[which_beyond]
 
     return reward, penalty
+
+
+def torch_comb(n: Union[int, np.array, torch.Tensor], i: Union[int, np.array, torch.Tensor]) -> torch.Tensor:
+    return torch.tensor(comb(n, i), requires_grad=False)
+
+
+def bernstein_poly_torch(i: int, n: int, t: int) -> int:
+    """
+    The Bernstein polynomial of n, i as a function of t
+    """
+    return torch_comb(n, i) * (t ** (n - i)) * (1 - t) ** i
+
+
+@lru_cache
+def cached_bernstein_polynomials(num_control_points: int, num_output_points: int) -> torch.Tensor:
+    t = torch.linspace(0, 1, num_output_points)
+    return torch.column_stack([
+        bernstein_poly_torch(i, num_control_points - 1, t)
+        for i in range(num_control_points)
+    ])
+
+
+def bezier_curve_in_torch(control_points: torch.Tensor, num_output_points: int) -> torch.Tensor:
+    """Given a set of control points, return the Bezier curve defined by the control points."""
+
+    num_control_points = len(control_points)
+    bern_poly = cached_bernstein_polynomials(num_control_points, num_output_points)
+
+    # We flip the points such that they correnspond to the order of the control points
+    return (bern_poly @ control_points).flip(0)
+    
