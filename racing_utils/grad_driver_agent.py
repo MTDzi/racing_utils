@@ -18,21 +18,17 @@ IDX = 0
 
 class GradientDriverAgent(BaseAgent):
     """Controls the car using a trained model + modifying part of its input so as to maximize reward.
-
     Runs inference for the model and modifies the controller parameters (that are part of the input of the model)
     according to an approximated gradient of the (progress - penalty) objective function.
-
     Attributes:
         points: A list containing the arrays: centerline, left_bound, and right_bound.
         num_steps: How many elements from arrays in the points list are used.
-
         omniward_model: Model that predicts the future trajectory (2D positions of the car) and
             future actuator actions needed to realize that trajectory.
         features_scalers: A mapping from feature names to features scalers that are required to make predictions
             with the model.
         targets_scalers: A mapping from target names to target scalers that are required to unpack predictions
             made with the model (so as to get proper actuator values).
-
         eta: Step size used in the space of controller parameters (after scaling) used for approximating the gradient
             of the objective function; the bigger the step, the less reliable it is; the smaller the step, the more
             noisy the approximation. After approximating the gradient, controller parameter values are modified via a crude
@@ -44,7 +40,6 @@ class GradientDriverAgent(BaseAgent):
             modifying its behavior based on their values.
         step_directions: A matrix whose rows correnspond to vectors by which the controller parameter values ought to be
             modified when forming a batch for estimating.
-
         penalty_scale_coeff: The objective function is actually not (progress - penalty) but rather:
             progress + penalty_scale_coeff * penalty.
         penalty_sigma: The sigma used in the Gaussian-distribution-like components when calculating the penalty (see 
@@ -135,7 +130,9 @@ class GradientDriverAgent(BaseAgent):
         self.bezier_degree = bezier_degree
         self.debug = debug
 
-        # For transforming ranges into ranges_as_vec
+
+    def setup_cache(self):
+        # Cache the following attributes instead of re-calculating them every time
         self.idx_to_angle = np.array([
             self.ANGLE_MIN + idx * self.ANGLE_INCR
             for idx in range(self.SCAN_LEN)
@@ -144,6 +141,7 @@ class GradientDriverAgent(BaseAgent):
             np.array([np.cos(self.idx_to_angle[idx]), np.sin(self.idx_to_angle[idx])])
             for idx in range(self.SCAN_LEN)
         ])
+        
 
     def set_bezier_degree(self, bezier_degree: int, num_alternatives: int): # TODO: alloc num_alternatives
         self.bezier_degree = bezier_degree
@@ -198,25 +196,16 @@ class GradientDriverAgent(BaseAgent):
 
 
 
-        # For transforming ranges into ranges_as_vec
-        self.idx_to_angle = np.array([
-            self.ANGLE_MIN + idx * self.ANGLE_INCR
-            for idx in range(self.SCAN_LEN)
-        ])
-        self.versor = np.array([
-            np.array([np.cos(self.idx_to_angle[idx]), np.sin(self.idx_to_angle[idx])])
-            for idx in range(self.SCAN_LEN)
-        ])
         self.grad_clip_threshold = 1.0
 
-        self.alternative_better_threshold = 0.1
-
-
+        
 
 
 
         position = np.array([pos_x, pos_y])
-        centerline, left_bound, right_bound = self.extract_centerline_and_bounds(yaw, position)
+        ranges_as_vec = torch.tensor(ranges[:, np.newaxis] * self.versor, requires_grad=False, device=self.device)
+
+        centerline, left_bound, right_bound, best_score = self.random_probe_planner.plan(position, yaw, ranges_as_vec)
 
         # This is where the prediction takes place
         trajectory_pred, actuators_pred, curr_contr_params_scaled = self.calc_predictions(
@@ -247,69 +236,65 @@ class GradientDriverAgent(BaseAgent):
             left_bound,
             right_bound,
             ranges=ranges_as_vec,
-            penalty_sigma=self.penalty_sigma,
         )
 
         reward_pred = (progress_pred + self.penalty_scale_coeff * penalty_pred).cpu()
         base_reward = float(reward_pred[NOT_MODIFIED_IDX])
 
-        # Let's check if any of the alternatives is better than the base case
-        alternative_rewards = reward_pred[1:(1 + self.num_alternatives)]
-        # best_alternative = torch.argmax(alternative_rewards - base_reward)
-        if False: # alternative_rewards[best_alternative] > base_reward + self.alternative_better_threshold:
-            # If any of the alternatives is better than the base case (to which we arrived using a gradient-based
-            #  approach), we stop the optimization procedure, keep the current controller parameters, and switch
-            #  to the Bezier modification that corresnponds to that alternative
-            self.curr_bezier_points_delta = self.alternative_bezier_point_deltas[best_alternative].copy()
+        # But if no alternative was better, we continue out gradient-based procedure
+        offset = 1
 
-        else:
-            # But if no alternative was better, we continue out gradient-based procedure
-            offset = 1 + self.num_alternatives
+        # 3) Finally, we need to compute the gradient of self.curr_bezier_points_delta
+        num_bezier_coords = POINT_DIM * self.num_bezier_points
+        grad_bezier_points_delta = np.zeros(num_bezier_coords)
+        x = self.eta_for_grad * np.arange(-self.num_steps_for_grad, self.num_steps_for_grad + 1)
+        for bezier_idx in range(num_bezier_coords):
+            reward = []
+            for step in range(2 * self.num_steps_for_grad):
+                idx = offset + bezier_idx + step * num_bezier_coords
+                reward.append(float(reward_pred[idx]))
+                if step == self.num_steps_for_grad:
+                    reward.append(base_reward)    
 
-            # 3) Finally, we need to compute the gradient of self.curr_bezier_points_delta
-            num_bezier_coords = POINT_DIM * self.num_bezier_points
-            grad_bezier_points_delta = np.zeros(num_bezier_coords)
-            x = self.eta_for_grad * np.arange(-self.num_steps_for_grad, self.num_steps_for_grad + 1)
-            for bezier_idx in range(num_bezier_coords):
-                reward = []
-                for step in range(2 * self.num_steps_for_grad):
-                    idx = offset + bezier_idx + step * num_bezier_coords
-                    reward.append(float(reward_pred[idx]))
-                    if step == self.num_steps_for_grad:
-                        reward.append(base_reward)    
+            slope = np.polyfit(x, reward, deg=1)[0]  # Fit a line and take the slope
+            grad_bezier_points_delta[bezier_idx] = np.clip(slope, -self.grad_clip_threshold, self.grad_clip_threshold)
 
-                slope = np.polyfit(x, reward, deg=1)[0]  # Fit a line and take the slope
-                grad_bezier_points_delta[bezier_idx] = np.clip(slope, -self.grad_clip_threshold, self.grad_clip_threshold)
+        # TODO: no changes to the centerline
+        self.curr_bezier_points_delta += (self.eta_for_update * grad_bezier_points_delta).reshape(-1, 2)
+        # self.curr_bezier_points_delta[0] = 0, 0  # TODO
+        self.curr_bezier_points_delta[:, 1] = np.clip(self.curr_bezier_points_delta[:, 1], -0.3, 0.3)
 
-            self.curr_bezier_points_delta += (self.eta_for_update * grad_bezier_points_delta).reshape(-1, 2)
-            # self.curr_bezier_points_delta[0] = 0, 0  # TODO
-            self.curr_bezier_points_delta[:, 1] = np.clip(self.curr_bezier_points_delta[:, 1], -0.4, 0.4)
+        offset += self.bezier_points_step_shape
 
-            offset += self.bezier_points_step_shape
+        # 2) OK, time for gradient estimation for contr_params
+        # NOTE: the following code is not the fastest implementation of the gradient estimation but notice that
+        #  the call above (to calc_progress_and_penalty_while_driving) is the real bottleneck. And if no GPU is available you won't
+        #  get a significant speedup by optimizing the gradient estimating below
+        grad_contr_param = np.zeros(self.num_contr_params)
+        x = self.eta_for_grad * np.arange(-self.num_steps_for_grad, self.num_steps_for_grad + 1)
+        for contr_param_idx in range(self.num_contr_params):
+            reward = []
+            for step in range(2 * self.num_steps_for_grad):
+                idx = offset + contr_param_idx + step * self.num_contr_params
+                reward.append(float(reward_pred[idx]))
+                if step == self.num_steps_for_grad:
+                    reward.append(base_reward)
+                    
+            slope = np.polyfit(x, reward, deg=1)[0]  # Fit a line and take the slope
+            grad_contr_param[contr_param_idx] = np.clip(slope, -self.grad_clip_threshold, self.grad_clip_threshold)
 
-            # 2) OK, time for gradient estimation for contr_params
-            # NOTE: the following code is not the fastest implementation of the gradient estimation but notice that
-            #  the call above (to calc_progress_and_penalty_while_driving) is the real bottleneck. And if no GPU is available you won't
-            #  get a significant speedup by optimizing the gradient estimating below
-            grad_contr_param = np.zeros(self.num_contr_params)
-            x = self.eta_for_grad * np.arange(-self.num_steps_for_grad, self.num_steps_for_grad + 1)
-            for contr_param_idx in range(self.num_contr_params):
-                reward = []
-                for step in range(2 * self.num_steps_for_grad):
-                    idx = offset + contr_param_idx + step * self.num_contr_params
-                    reward.append(float(reward_pred[idx]))
-                    if step == self.num_steps_for_grad:
-                        reward.append(base_reward)
-                        
-                slope = np.polyfit(x, reward, deg=1)[0]  # Fit a line and take the slope
-                grad_contr_param[contr_param_idx] = np.clip(slope, -self.grad_clip_threshold, self.grad_clip_threshold)
+        self.curr_contr_params = self.features_scalers['contr_params'].inverse_transform(
+            curr_contr_params_scaled
+            + self.eta_for_update * torch.tensor(grad_contr_param, device=self.device)
+        )
+        # Clip the controller parameters according to their limits
+        self.curr_contr_params = torch.clip(self.curr_contr_params, min=self.contr_params_limits[:, 0], max=self.contr_params_limits[:, 1])
 
-            self.curr_contr_params = self.features_scalers['contr_params'].inverse_transform(
-                curr_contr_params_scaled
-                + self.eta_for_update * torch.tensor(grad_contr_param, device=self.device)
-            )
-            # Clip the controller parameters according to their limits
-            self.curr_contr_params = torch.clip(self.curr_contr_params, min=self.contr_params_limits[:, 0], max=self.contr_params_limits[:, 1])
+
+
+        self.random_probe_planner.update_waypoints(centerline.cpu().numpy(), position, yaw)
+
+
 
         if self.debug:
             print(f'lookahead = {self.curr_contr_params[0]:.2f}, '
@@ -418,12 +403,6 @@ class GradientDriverAgent(BaseAgent):
         curr_waypoints = curr_waypoints.flatten()
         
         waypoints_modified = []
-        # The first type of modifications comes from the alternative Bezier points
-        for bezier_points in self.alternative_bezier_point_deltas:
-            mod_waypoints = self._modify_waypoints(bezier_points, centerline_cpu, translation, yaw)
-            waypoints_modified.append(mod_waypoints)
-
-        # The second type of modifications comes from the step directions and will be used for estimating the gradient
         bezier_points_modified = self.curr_bezier_points_delta + self.eta_for_grad * self.bezier_points_step_directions
         bezier_points_modified = bezier_points_modified.reshape(-1, self.num_bezier_points, POINT_DIM)
         for bezier_points in bezier_points_modified:
@@ -450,3 +429,4 @@ class GradientDriverAgent(BaseAgent):
         ]
         mod_waypoints = rotate_into_map_coord(mod_waypoints, yaw) + translation
         return mod_waypoints
+        

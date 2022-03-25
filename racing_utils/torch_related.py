@@ -157,7 +157,6 @@ def calc_progress_and_penalty_while_driving(
         left_bound: torch.Tensor,
         right_bound: torch.Tensor,
         ranges: Optional[torch.Tensor] = None,
-        penalty_sigma: float = 0.4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Calculates the progress along the centerline + penalty caused by closeness to any of the bounds.
@@ -184,53 +183,77 @@ def calc_progress_and_penalty_while_driving(
     last_centerline_vector = centerline[closest_centerline_idx_for_last_centerline_vector] - centerline[closest_centerline_idx_for_last_centerline_vector - 1]
     
     reward -= (versor_to_last_position * last_centerline_vector).sum(axis=1)
-    
-    penalty = 0
-    dupa = 0.25  # TODO
-    for bound in [left_bound, right_bound]:
-        distances = torch.linalg.norm(bound[None, None] - trajectory[:, :, None], axis=3)
-        gaussed_distances = torch.exp(-distances / penalty_sigma / penalty_sigma) / sqrt(2 * torch.pi) / penalty_sigma
-        gaussed_distances = gaussed_distances * (distances < dupa).float()    
-        penalty += gaussed_distances.sum(axis=(1, 2))
 
+    # Now for the penalty    
+    obstacles = [left_bound, right_bound]
     if ranges is not None:
-        distances = torch.linalg.norm(ranges[None, None] - trajectory[:, :, None], axis=3)
-        gaussed_distances = torch.exp(-distances / penalty_sigma / penalty_sigma) / sqrt(2 * torch.pi) / penalty_sigma
-        gaussed_distances = gaussed_distances * (distances < dupa).float()    
-        penalty += gaussed_distances.sum(axis=(1, 2))
-
-    # which_beyond = (penalty > reward)
-    # penalty[which_beyond] = reward[which_beyond]
+        obstacles.append(ranges)
+    penalty = 0
+    for bound in obstacles:
+        distances = torch.linalg.norm(bound[None, None] - trajectory[:, :, None], axis=3)
+        penalty -= distances.min(axis=1).values.min(axis=1).values
 
     return reward, penalty
 
 
-def torch_comb(n: Union[int, np.array, torch.Tensor], i: Union[int, np.array, torch.Tensor]) -> torch.Tensor:
-    return torch.tensor(comb(n, i), requires_grad=False)
+def torch_comb(n: Union[int, np.array, torch.Tensor], i: Union[int, np.array, torch.Tensor], device: str) -> torch.Tensor:
+    return torch.tensor(comb(n, i), requires_grad=False, device=device)
 
 
-def bernstein_poly_torch(i: int, n: int, t: int) -> int:
+def bernstein_poly(i: int, n: int, t: int, device: str) -> int:
     """
     The Bernstein polynomial of n, i as a function of t
     """
-    return torch_comb(n, i) * (t ** (n - i)) * (1 - t) ** i
+    return torch_comb(n, i, device) * (t ** (n - i)) * (1 - t) ** i
 
 
 @lru_cache
-def cached_bernstein_polynomials(num_control_points: int, num_output_points: int) -> torch.Tensor:
-    t = torch.linspace(0, 1, num_output_points)
+def cached_bernstein_polynomials(num_control_points: int, num_output_points: int, device: str) -> torch.Tensor:
+    t = torch.linspace(0, 1, num_output_points, device=device)
     return torch.column_stack([
-        bernstein_poly_torch(i, num_control_points - 1, t)
+        bernstein_poly(i, num_control_points - 1, t, device)
         for i in range(num_control_points)
     ])
 
 
-def bezier_curve_in_torch(control_points: torch.Tensor, num_output_points: int) -> torch.Tensor:
+def bezier_curve(control_points: torch.Tensor, num_output_points: int, device: str) -> torch.Tensor:
     """Given a set of control points, return the Bezier curve defined by the control points."""
 
     num_control_points = len(control_points)
-    bern_poly = cached_bernstein_polynomials(num_control_points, num_output_points)
+    bern_poly = cached_bernstein_polynomials(num_control_points, num_output_points, device=device)
 
     # We flip the points such that they correnspond to the order of the control points
-    return (bern_poly @ control_points).flip(0)
-    
+    return (bern_poly @ control_points.float()).flip(0)
+
+
+def bezier_curve_batch(batch_of_control_points: torch.Tensor, num_output_points: int, device: str) -> torch.Tensor:
+    """Given a set of control points, return the Bezier curve defined by the control points."""
+
+    num_control_points = len(batch_of_control_points[0])
+    bern_poly = cached_bernstein_polynomials(num_control_points, num_output_points, device=device)
+
+    # We flip the points such that they correnspond to the order of the control points
+    return (bern_poly @ batch_of_control_points.float()).flip(1)
+
+
+@lru_cache(maxsize=1000)
+def get_rotation_matrix(angle_rad: float, device: str) -> torch.Tensor:
+    """Construct and memoize a 2D rotation matrix for a given angle (in radians)."""
+    cos = torch.cos(angle_rad)
+    sin = torch.sin(angle_rad)
+    return torch.tensor([[cos, sin], [-sin, cos]], device=device)
+
+
+def rotate_into_map_coord(vec: torch.Tensor, angle_rad: float, device: str) -> torch.Tensor:
+    """Rotate a vector (or vectors) by a given angle (in radians)."""
+    rot_mat = get_rotation_matrix(angle_rad, device)
+    return vec @ rot_mat
+
+
+def straighten_up_arc(arc: torch.Tensor, device: str) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    translation = -arc[0]
+    arc += translation
+    direction = arc[-1]
+    yaw = torch.atan2(direction[0], direction[1]) - torch.pi / 2
+    arc = rotate_into_map_coord(arc, yaw, device)
+    return arc, -translation, -yaw
