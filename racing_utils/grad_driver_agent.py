@@ -1,14 +1,16 @@
 from typing import Dict, Optional, Sequence, Tuple, Dict, Any
-import matplotlib.pyplot as plt
 
 import numpy as np
-
 import torch
 
-from .torch_related import TensorStandardScaler, calc_progress_and_penalty_while_driving
-from .utils import rotate_into_map_coord, closest_point_idx, cyclic_slice, straighten_up_arc
+from .torch_related import (
+    TensorStandardScaler,
+    calc_progress_and_penalty_while_driving,
+    modify_waypoints_in_batch,
+    modify_waypoints,
+    straighten_up_arc,
+)
 from .base_agent import BaseAgent
-from .bezier import get_bezier_parameters, bezier_curve
 
 
 NOT_MODIFIED_IDX = 0
@@ -21,7 +23,7 @@ class GradientDriverAgent(BaseAgent):
     Runs inference for the model and modifies the controller parameters (that are part of the input of the model)
     according to an approximated gradient of the (progress - penalty) objective function.
     Attributes:
-        points: A list containing the arrays: centerline, left_bound, and right_bound.
+        points: A list containing the arrays: waypoints, left_bound, and right_bound.
         num_steps: How many elements from arrays in the points list are used.
         omniward_model: Model that predicts the future trajectory (2D positions of the car) and
             future actuator actions needed to realize that trajectory.
@@ -143,42 +145,31 @@ class GradientDriverAgent(BaseAgent):
         ])
         
 
-    def set_bezier_degree(self, bezier_degree: int, num_alternatives: int): # TODO: alloc num_alternatives
+    def set_bezier_degree(self, bezier_degree: int):
         self.bezier_degree = bezier_degree
-        num_steps_centerline = self.nums_steps[0]
 
-        # Initialize the curr_bezier_points_delta with control points corresponding to a straight line with
-        #  all Y-s equal to zero (which means: don't modify the centerline)
-        zero_modifications = np.c_[np.linspace(0, 1, num_steps_centerline), np.zeros(num_steps_centerline)]
-        self.curr_bezier_points_delta = np.r_[get_bezier_parameters(zero_modifications[:, 0], zero_modifications[:, 1], degree=self.bezier_degree)]
-
-        # We'll keep a couple of alternative Bezier modifications in case the optimization gets stuck
-        # TODO: could just copy the curr_bezier_points_deltas 
-        self.alternative_bezier_point_deltas = np.r_[[get_bezier_parameters(zero_modifications[:, 0], zero_modifications[:, 1], degree=self.bezier_degree)]]
-        self.alternative_bezier_point_deltas = np.r_[[]]
-        self.num_alternatives = len(self.alternative_bezier_point_deltas)  # TODO
-
-        self.num_bezier_points = self.bezier_degree + 1
+        self.num_modifiable_bezier_points = self.bezier_degree - 1  # Meaning: the terminal points will NOT be modified
         self.bezier_points_step_directions = np.concatenate([
-            [-step * np.eye(POINT_DIM * self.num_bezier_points) for step in reversed(range(1, self.num_steps_for_grad + 1))]
-            + [ step * np.eye(POINT_DIM * self.num_bezier_points) for step in range(1, self.num_steps_for_grad + 1)]
+            [-step * np.eye(self.num_modifiable_bezier_points) for step in reversed(range(1, self.num_steps_for_grad + 1))]
+            + [ step * np.eye(self.num_modifiable_bezier_points) for step in range(1, self.num_steps_for_grad + 1)]
         ], axis=0)
         self.bezier_points_step_directions = self.bezier_points_step_directions.reshape(
-
-            2 * self.num_steps_for_grad,  # "2 * " because there are two directions per dimension, i.e. (-step, +step)
-            POINT_DIM * self.num_bezier_points,  # each point has POINT_DIM coordinates
-
-            # Now, for each direction and each Bezier point coordinate there's a matrix of the 
-            #  following shape (only one position has "1", there rest are "0") that
-            #  will be added to the Bezier points
-            self.num_bezier_points,
-            POINT_DIM,
+            (2 * self.num_steps_for_grad) * self.num_modifiable_bezier_points,
+            self.num_modifiable_bezier_points,
         )
-        self.bezier_points_step_shape = self.bezier_points_step_directions.shape[0] * self.bezier_points_step_directions.shape[1]
+        self.bezier_points_step_directions = np.column_stack([
+            np.zeros(self.bezier_points_step_directions.shape[0]),
+            self.bezier_points_step_directions,
+            np.zeros(self.bezier_points_step_directions.shape[0]),
+        ])
+        self.bezier_points_step_directions = np.stack([
+            np.zeros_like(self.bezier_points_step_directions),
+            self.bezier_points_step_directions
+        ], axis=2)
 
-        self.batch_size = 1 + self.contr_params_step_shape + self.bezier_points_step_shape + self.num_alternatives
-
-
+        self.bezier_points_step_directions = self.eta_for_waypoints_grad * torch.tensor(self.bezier_points_step_directions, device=self.device)
+        self.batch_size = 1 + self.contr_params_step_shape + self.bezier_points_step_directions.shape[0]
+    
 
     def plan(
             self,
@@ -205,11 +196,11 @@ class GradientDriverAgent(BaseAgent):
         position = np.array([pos_x, pos_y])
         ranges_as_vec = torch.tensor(ranges[:, np.newaxis] * self.versor, requires_grad=False, device=self.device)
 
-        centerline, left_bound, right_bound, best_score = self.random_probe_planner.plan(position, yaw, ranges_as_vec)
+        waypoints, centerline, left_bound, right_bound, best_score = self.random_probe_planner.plan(position, yaw, ranges_as_vec)
 
         # This is where the prediction takes place
-        trajectory_pred, actuators_pred, curr_contr_params_scaled = self.calc_predictions(
-            centerline,
+        trajectory_pred, actuators_pred, curr_contr_params_scaled, curr_waypoints_straight, straighting_translation, straighting_yaw = self.calc_predictions(
+            waypoints,
             linear_vel_x,
             linear_vel_y,
             angular_vel_z,
@@ -222,9 +213,6 @@ class GradientDriverAgent(BaseAgent):
         self.curr_speed = float(speeds_and_deltas[first_speed_actuator_idx])
         self.curr_delta = float(speeds_and_deltas[first_delta_actuator_idx])
 
-        # Turn the lidar scan into 2D points in the car's reference frame
-        ranges_as_vec = torch.tensor(ranges[:, np.newaxis] * self.versor, requires_grad=False, device=self.device)
-        
         #                                                                                  # 
         #  Now for the heavier part: calculating the gradient of the progress and penalty  #
         #                                                                                  #
@@ -238,20 +226,19 @@ class GradientDriverAgent(BaseAgent):
             ranges=ranges_as_vec,
         )
 
-        reward_pred = (progress_pred + self.penalty_scale_coeff * penalty_pred).cpu()
+        reward_pred = (progress_pred + self.penalty_scale_coeff / penalty_pred).cpu()
         base_reward = float(reward_pred[NOT_MODIFIED_IDX])
 
         # But if no alternative was better, we continue out gradient-based procedure
         offset = 1
 
         # 3) Finally, we need to compute the gradient of self.curr_bezier_points_delta
-        num_bezier_coords = POINT_DIM * self.num_bezier_points
-        grad_bezier_points_delta = np.zeros(num_bezier_coords)
+        grad_bezier_points_delta = np.zeros(self.num_modifiable_bezier_points)
         x = self.eta_for_grad * np.arange(-self.num_steps_for_grad, self.num_steps_for_grad + 1)
-        for bezier_idx in range(num_bezier_coords):
+        for bezier_idx in range(self.num_modifiable_bezier_points):
             reward = []
             for step in range(2 * self.num_steps_for_grad):
-                idx = offset + bezier_idx + step * num_bezier_coords
+                idx = offset + bezier_idx + step * self.num_modifiable_bezier_points
                 reward.append(float(reward_pred[idx]))
                 if step == self.num_steps_for_grad:
                     reward.append(base_reward)    
@@ -259,12 +246,13 @@ class GradientDriverAgent(BaseAgent):
             slope = np.polyfit(x, reward, deg=1)[0]  # Fit a line and take the slope
             grad_bezier_points_delta[bezier_idx] = np.clip(slope, -self.grad_clip_threshold, self.grad_clip_threshold)
 
-        # TODO: no changes to the centerline
-        self.curr_bezier_points_delta += (self.eta_for_update * grad_bezier_points_delta).reshape(-1, 2)
-        # self.curr_bezier_points_delta[0] = 0, 0  # TODO
-        self.curr_bezier_points_delta[:, 1] = np.clip(self.curr_bezier_points_delta[:, 1], -0.3, 0.3)
-
-        offset += self.bezier_points_step_shape
+        bezier_modification = np.r_[0, self.eta_for_waypoints_update * grad_bezier_points_delta, 0]
+        bezier_modification = np.c_[np.zeros_like(bezier_modification), bezier_modification]
+        bezier_modification = torch.tensor(bezier_modification, device=self.device)
+        waypoints_modified = modify_waypoints(bezier_modification, curr_waypoints_straight, straighting_translation, straighting_yaw)
+        waypoints[:self.modification_steps] = waypoints_modified
+        
+        offset += self.bezier_points_step_directions.shape[0]
 
         # 2) OK, time for gradient estimation for contr_params
         # NOTE: the following code is not the fastest implementation of the gradient estimation but notice that
@@ -291,22 +279,16 @@ class GradientDriverAgent(BaseAgent):
         self.curr_contr_params = torch.clip(self.curr_contr_params, min=self.contr_params_limits[:, 0], max=self.contr_params_limits[:, 1])
 
 
+        
+        self.random_probe_planner.update_waypoints(waypoints.cpu().numpy(), position, yaw)
 
-        self.random_probe_planner.update_waypoints(centerline.cpu().numpy(), position, yaw)
-
-
-
-        if self.debug:
-            print(f'lookahead = {self.curr_contr_params[0]:.2f}, '
-                  f'speed_setpoint = {self.curr_contr_params[1]:.2f}, '
-                  f'tire_force_max = {self.curr_contr_params[2]:.2f}')
 
         if self.ego_data is not None:
             self._gather_data(
                 yaw, position, linear_vel_x, linear_vel_y, angular_vel_z,
                 self.curr_delta, self.curr_speed, lap_time,
                 bezier_points_delta=self.curr_bezier_points_delta.copy(),
-                centerline=centerline.cpu().numpy(),
+                waypoints=waypoints.cpu().numpy(),
                 left_bound=left_bound.cpu().numpy(),
                 right_bound=right_bound.cpu().numpy(),
                 ranges=ranges_as_vec.cpu().numpy(),
@@ -317,25 +299,10 @@ class GradientDriverAgent(BaseAgent):
 
         return self.curr_speed, self.curr_delta
 
-    def extract_centerline_and_bounds(
-            self,
-            yaw: float,
-            position: np.array,
-    ) -> Tuple[np.array, np.array, np.array]:
-        """Extract centerline and bound slices used for prediction and reward calculations."""
-        points_slices = []
-        for points, num_steps in zip(self.points, self.nums_steps):
-            closest_idx = closest_point_idx(position, points)
-            points_slice = cyclic_slice(points, closest_idx, num_steps)
-            points_slice = rotate_into_map_coord(points_slice - position, -yaw)
-            points_slice = torch.tensor(points_slice, device=self.device, dtype=torch.float)
-            points_slices.append(points_slice)
-        centerline, left_bound, right_bound = points_slices
-        return centerline, left_bound, right_bound
 
     def calc_predictions(
             self,
-            centerline: np.array,
+            curr_waypoints: torch.Tensor,
             linear_vel_x: float,
             linear_vel_y: float,
             angular_vel_z: float,
@@ -348,10 +315,19 @@ class GradientDriverAgent(BaseAgent):
         state = torch.tile(state, (self.batch_size, 1))
         state_scaled = self.features_scalers['state'].transform(state)
 
-        curr_waypoints, waypoints_modified = self._bezierize_and_modify_waypoints(centerline)
-        curr_waypoints_tiled = torch.tile(curr_waypoints, (self.contr_params_step_shape, 1))
-        waypoints = torch.concat([curr_waypoints[None], waypoints_modified, curr_waypoints_tiled])
-        waypoints_scaled = self.features_scalers['waypoints'].transform(waypoints.to(self.device))
+        curr_waypoints_straight, translation, yaw = straighten_up_arc(curr_waypoints[:self.modification_steps].clone())
+        waypoints_modified = modify_waypoints_in_batch(self.bezier_points_step_directions, curr_waypoints_straight, translation, yaw)
+        waypoints_unmodified_tiled = torch.tile(curr_waypoints[self.modification_steps:], (waypoints_modified.shape[0], 1, 1))
+        waypoints_modified = torch.concat([waypoints_modified, waypoints_unmodified_tiled], axis=1)
+
+        curr_waypoints_tiled = torch.tile(curr_waypoints, (self.contr_params_step_shape, 1, 1))
+        waypoints = torch.concat([
+            curr_waypoints.reshape(1, -1),
+            waypoints_modified.reshape(waypoints_modified.shape[0], -1),
+            curr_waypoints_tiled.reshape(curr_waypoints_tiled.shape[0], -1),
+        ])
+        # TODO: The scaling could be done prior to the concat, might be faster 
+        waypoints_scaled = self.features_scalers['waypoints'].transform(waypoints)
 
         curr_contr_params_scaled = self.features_scalers['contr_params'].transform(contr_params)
         contr_params_modified = curr_contr_params_scaled + self.eta_for_grad * self.contr_params_step_directions
@@ -367,14 +343,15 @@ class GradientDriverAgent(BaseAgent):
             preds = self.omniward_model(state_scaled, contr_params, waypoints_scaled, None, None, None)
             trajectory_pred, actuators_pred = preds['trajectory_pred'], preds['actuators_pred']
 
-        return trajectory_pred, actuators_pred, contr_params[NOT_MODIFIED_IDX]
+        return trajectory_pred, actuators_pred, contr_params[NOT_MODIFIED_IDX], curr_waypoints_straight, translation, yaw
+
 
     def _compose_additional_data(self) -> Dict[str, Any]:
         return {
             'lookahead_distance': float(self.curr_contr_params[0]),
             'speed_setpoint': float(self.curr_contr_params[1]),
             'tire_force_max': float(self.curr_contr_params[2]),
-            'centerline': self.points[0],
+            'waypoints': self.points[0],
             'left_bound': self.points[1],
             'right_bound': self.points[2],
         }
@@ -391,42 +368,3 @@ class GradientDriverAgent(BaseAgent):
 
         for targets_scaler in self.targets_scalers.values():
             targets_scaler.to(self.device)
-
-    def _bezierize_and_modify_waypoints(self, centerline: torch.Tensor) -> Tuple[np.array, np.array]:
-        centerline_cpu = centerline.cpu().numpy()  # TODO: ugh, can be done better
-        centerline_cpu, translation, yaw = straighten_up_arc(centerline_cpu)
-
-        # We want the unmodified curr_waypoints to be of shape:
-        #   (POINT_DIM * len(centerline), )
-        #  to then tile them
-        curr_waypoints = self._modify_waypoints(self.curr_bezier_points_delta, centerline_cpu, translation, yaw)
-        curr_waypoints = curr_waypoints.flatten()
-        
-        waypoints_modified = []
-        bezier_points_modified = self.curr_bezier_points_delta + self.eta_for_grad * self.bezier_points_step_directions
-        bezier_points_modified = bezier_points_modified.reshape(-1, self.num_bezier_points, POINT_DIM)
-        for bezier_points in bezier_points_modified:
-            mod_waypoints = self._modify_waypoints(bezier_points, centerline_cpu, translation, yaw)
-            waypoints_modified.append(mod_waypoints)
-            
-        # Stack the modified waypoints
-        # TODO: you could allocate the result and avoid this copying, even in the __init__
-        waypoints_modified = np.r_[waypoints_modified]
-
-        # We want the modified waypoints be of the shape:
-        #   (self.bezier_points_step_shape, POINT_DIM * len(centerline))
-        #  to then concat it togher with the contr_params part of the batch
-        waypoints_modified = waypoints_modified.reshape(waypoints_modified.shape[0], -1)
-        
-        return torch.tensor(curr_waypoints, dtype=torch.float32), torch.tensor(waypoints_modified, dtype=torch.float32)
-
-    @staticmethod
-    def _modify_waypoints(bezier_points: np.array, centerline: np.array, translation: np.array, yaw: float) -> np.array:
-        bcurve = bezier_curve(bezier_points, num_points=len(centerline))
-        mod_waypoints = np.c_[
-            centerline[:, 0],
-            centerline[:, 1] + bcurve[:, 1]
-        ]
-        mod_waypoints = rotate_into_map_coord(mod_waypoints, yaw) + translation
-        return mod_waypoints
-        

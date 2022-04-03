@@ -216,21 +216,21 @@ def cached_bernstein_polynomials(num_control_points: int, num_output_points: int
     ])
 
 
-def bezier_curve(control_points: torch.Tensor, num_output_points: int, device: str) -> torch.Tensor:
+def bezier_curve(control_points: torch.Tensor, num_output_points: int) -> torch.Tensor:
     """Given a set of control points, return the Bezier curve defined by the control points."""
 
     num_control_points = len(control_points)
-    bern_poly = cached_bernstein_polynomials(num_control_points, num_output_points, device=device)
+    bern_poly = cached_bernstein_polynomials(num_control_points, num_output_points, device=control_points.device)
 
     # We flip the points such that they correnspond to the order of the control points
     return (bern_poly @ control_points.float()).flip(0)
 
 
-def bezier_curve_batch(batch_of_control_points: torch.Tensor, num_output_points: int, device: str) -> torch.Tensor:
+def bezier_curve_batch(batch_of_control_points: torch.Tensor, num_output_points: int) -> torch.Tensor:
     """Given a set of control points, return the Bezier curve defined by the control points."""
 
     num_control_points = len(batch_of_control_points[0])
-    bern_poly = cached_bernstein_polynomials(num_control_points, num_output_points, device=device)
+    bern_poly = cached_bernstein_polynomials(num_control_points, num_output_points, device=batch_of_control_points.device)
 
     # We flip the points such that they correnspond to the order of the control points
     return (bern_poly @ batch_of_control_points.float()).flip(1)
@@ -244,16 +244,37 @@ def get_rotation_matrix(angle_rad: float, device: str) -> torch.Tensor:
     return torch.tensor([[cos, sin], [-sin, cos]], device=device)
 
 
-def rotate_into_map_coord(vec: torch.Tensor, angle_rad: float, device: str) -> torch.Tensor:
+def rotate_into_map_coord(vec: torch.Tensor, angle_rad: float) -> torch.Tensor:
     """Rotate a vector (or vectors) by a given angle (in radians)."""
-    rot_mat = get_rotation_matrix(angle_rad, device)
+    rot_mat = get_rotation_matrix(angle_rad, vec.device)
     return vec @ rot_mat
 
 
-def straighten_up_arc(arc: torch.Tensor, device: str) -> Tuple[torch.Tensor, torch.Tensor, float]:
+def straighten_up_arc(arc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
     translation = -arc[0]
     arc += translation
     direction = arc[-1]
     yaw = torch.atan2(direction[0], direction[1]) - torch.pi / 2
-    arc = rotate_into_map_coord(arc, yaw, device)
+    arc = rotate_into_map_coord(arc, yaw)
     return arc, -translation, -yaw
+
+
+def modify_waypoints(bezier_points: torch.Tensor, waypoints: torch.Tensor, translation: torch.Tensor, yaw: float) -> torch.Tensor:
+    bcurve = bezier_curve(bezier_points, len(waypoints))
+    mod_waypoints = torch.column_stack([
+        waypoints[:, 0],
+        waypoints[:, 1] + bcurve[:, 1]
+    ])
+    mod_waypoints = rotate_into_map_coord(mod_waypoints, yaw) + translation
+    return mod_waypoints
+
+
+def modify_waypoints_in_batch(bezier_points: torch.Tensor, waypoints: torch.Tensor, translation: torch.Tensor, yaw: float) -> torch.Tensor:
+    num_samples_for_grad = bezier_points.shape[0]
+    bcurve = bezier_curve_batch(bezier_points, len(waypoints))
+    mod_waypoints = torch.stack([
+        waypoints[:, 0].repeat(num_samples_for_grad, 1),
+        (waypoints[:, 1] + bcurve[..., 1]),
+    ], axis=2)
+    mod_waypoints = rotate_into_map_coord(mod_waypoints, yaw) + translation
+    return mod_waypoints

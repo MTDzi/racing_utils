@@ -12,6 +12,7 @@ from .torch_related import straighten_up_arc as straighten_up_arc_in_torch
 from .torch_related import bezier_curve as bezier_curve_in_torch
 from .torch_related import bezier_curve_batch as bezier_curve_batch_in_torch
 from .torch_related import rotate_into_map_coord as rotate_into_map_coord_in_torch
+from .torch_related import modify_waypoints, modify_waypoints_in_batch
 
 
 class RandomProbePlanner:
@@ -113,7 +114,7 @@ class RandomProbePlanner:
     ) -> Tuple[torch.tensor, torch.tensor, torch.tensor]:
         """Extract centerline and bound slices used for prediction and reward calculations."""
         points_slices = []
-        for points in [self.left_bound, self.right_bound, self.waypoints]:
+        for points in [self.left_bound, self.right_bound, self.waypoints, self.waypoints]:
             closest_idx = closest_point_idx(position, points)
             points_slice = cyclic_slice(points, closest_idx, self.overall_steps)
             points_slice = rotate_into_map_coord(points_slice - position, -yaw)
@@ -121,11 +122,11 @@ class RandomProbePlanner:
             points_slices.append(points_slice)
 
         self.closest_waypoint_idx = closest_idx
-        left_bound, right_bound, waypoints = points_slices
+        left_bound, right_bound, waypoints, centerline = points_slices
         left_bound = left_bound[::self.bound_decimation]
         right_bound = right_bound[::self.bound_decimation]
 
-        return waypoints, left_bound, right_bound, yaw
+        return waypoints, centerline, left_bound, right_bound, yaw
 
 
     def _modify_waypoints(self, bezier_points: np.array, waypoints: np.array, translation: np.array, yaw: float) -> np.array:
@@ -151,7 +152,7 @@ class RandomProbePlanner:
 
 
     def plan(self, position, yaw, ranges_as_vec):
-        overall_waypoints, left_bound, right_bound, yaw = self.extract_waypoints_and_bounds(yaw, position)
+        overall_waypoints, centerline, left_bound, right_bound, yaw = self.extract_waypoints_and_bounds(yaw, position)
         modifiable_waypoints = overall_waypoints[:self.modification_steps]
         
         base_score = max(
@@ -163,10 +164,10 @@ class RandomProbePlanner:
         best_score = float(base_score)
 
         if base_score > -self.lowest_acceptable_dist:
-            modifiable_waypoints, translation, local_yaw = straighten_up_arc_in_torch(modifiable_waypoints, self.device)
+            modifiable_waypoints, translation, local_yaw = straighten_up_arc_in_torch(modifiable_waypoints)
             bezier_points_modified = self.zero_bezier_change + self.eta_for_grad * self.bezier_samples
             
-            waypoints_modified = self._modify_waypoints_in_batch(bezier_points_modified, modifiable_waypoints, translation, local_yaw)
+            waypoints_modified = modify_waypoints_in_batch(bezier_points_modified, modifiable_waypoints, translation, local_yaw)
 
             scores_modified = torch.max(torch.stack([
                 self.score_fn(waypoints_modified, ranges_as_vec),
@@ -179,13 +180,13 @@ class RandomProbePlanner:
                 which_best = offset + torch.argmin(scores_modified)
                 best_score = float(scores_modified[which_best])
                 bezier_points = self.zero_bezier_change + self.eta_for_update * self.bezier_samples[which_best]
-                modifiable_waypoints = self._modify_waypoints(bezier_points, modifiable_waypoints, translation, local_yaw)
+                modifiable_waypoints = modify_waypoints(bezier_points, modifiable_waypoints, translation, local_yaw)
             else:
-                modifiable_waypoints = rotate_into_map_coord_in_torch(modifiable_waypoints, local_yaw, self.device) + translation
+                modifiable_waypoints = rotate_into_map_coord_in_torch(modifiable_waypoints, local_yaw) + translation
 
         overall_waypoints[:self.modification_steps] = modifiable_waypoints
 
-        return overall_waypoints, left_bound, right_bound, best_score
+        return overall_waypoints, centerline, left_bound, right_bound, best_score
 
 
     def update_waypoints(self, waypoints, position, yaw):
